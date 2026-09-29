@@ -1,0 +1,5 @@
+# .beads/identity.toml — canonical, git-tracked.
+# Edited only at scope creation or by deliberate human/`gc` migration.
+
+[project]
+id = "8a45cce9-9e6c-42c2-a0ea-b7dff51df8e6"
