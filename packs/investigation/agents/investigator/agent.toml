@@ -1,0 +1,5 @@
+description = "Investigates vLLM engine crashes, model compatibility, attention/KV-cache and kernel failures, correctness, profiling, and performance; implements fixes when requested"
+scope = "rig"
+max_active_sessions = 1
+min_active_sessions = 0
+idle_timeout = "2h"
