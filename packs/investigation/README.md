@@ -2,14 +2,15 @@
 
 This local schema-2 pack supplies the rig-scoped template
 `vllm/investigation.investigator`. The city imports it only for the vllm rig.
-It inherits the city's Codex provider, supports one controller-managed
+It inherits the city's provider, supports one controller-managed
 worker at a time, and starts when routed work is available.
 
 The investigator handles engine crashes, model compatibility, attention and
 KV-cache layouts, GPU kernels, distributed execution, correctness, profiling,
 and performance. It produces reproducible diagnosis and a root-cause report.
 Tasks that say "Fix" or otherwise request implementation also produce a
-targeted patch and validation. Upstream publication requires explicit scope.
+targeted patch and validation, committed on an isolated worktree branch for
+human review. The agent does not merge, push, or publish.
 
 After changing the pack or city imports, reload the live controller:
 
