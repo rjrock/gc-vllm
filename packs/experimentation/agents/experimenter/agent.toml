@@ -1,0 +1,4 @@
+scope = "rig"
+max_active_sessions = 2
+min_active_sessions = 0
+idle_timeout = "2h"

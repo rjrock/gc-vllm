@@ -1,0 +1,4 @@
+[pack]
+name = "implementation"
+schema = 2
+description = "Implements evidence-supported vLLM fixes from experiment reports in isolated git worktrees"

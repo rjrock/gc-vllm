@@ -1,0 +1,4 @@
+[pack]
+name = "experimentation"
+schema = 2
+description = "Runs minimal, reproducible vLLM experiments with explicit hypotheses, predictions, and recorded results"

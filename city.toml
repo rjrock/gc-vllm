@@ -34,6 +34,10 @@ source = "https://github.com/gastownhall/gascity-packs/tree/main/gascity/roles"
 version = "sha:3b3b89f2011e06d84459aa7bea1552382f13930a"
 [rigs.imports.investigation]
 source = "./packs/investigation"
+[rigs.imports.experimentation]
+source = "./packs/experimentation"
+[rigs.imports.implementation]
+source = "./packs/implementation"
 
 [[rigs]]
 name = "llm-bench-runner"

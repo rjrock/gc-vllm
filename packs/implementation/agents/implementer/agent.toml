@@ -1,0 +1,5 @@
+description = "Implements and validates the best-supported fix from experiment results in a vLLM worktree"
+scope = "rig"
+max_active_sessions = 2
+min_active_sessions = 0
+idle_timeout = "2h"
