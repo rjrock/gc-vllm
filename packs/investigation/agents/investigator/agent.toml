@@ -1,4 +1,4 @@
-description = "Investigates vLLM engine crashes, model compatibility, attention/KV-cache and kernel failures, correctness, profiling, and performance"
+description = "Investigates rig engine crashes, model compatibility, attention/KV-cache and kernel failures, correctness, profiling, and performance"
 scope = "rig"
 max_active_sessions = 2
 min_active_sessions = 0

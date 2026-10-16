@@ -47,3 +47,14 @@ default_branch = "main"
 [rigs.imports.gc]
 source = "https://github.com/gastownhall/gascity-packs/tree/main/gascity/roles"
 version = "sha:3b3b89f2011e06d84459aa7bea1552382f13930a"
+
+[[rigs]]
+name = "aiter"
+default_branch = "main"
+[rigs.imports]
+[rigs.imports.experimentation]
+source = "./packs/experimentation"
+[rigs.imports.implementation]
+source = "./packs/implementation"
+[rigs.imports.investigation]
+source = "./packs/investigation"

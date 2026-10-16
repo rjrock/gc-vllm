@@ -1,17 +1,21 @@
-# vLLM implementation from experiment results
+# Rig implementation from experiment results
 
 This local schema-2 pack supplies the rig-scoped template
-`vllm/implementation.implementer`. It inherits the city provider, supports
-one controller-managed worker at a time, and starts when work is routed.
+`<rig>/implementation.implementer`. The city imports it per rig (currently
+`vllm` and `aiter`); each import renders its own `{{ .RigName }}`-scoped
+implementer against that rig's repository. It inherits the city provider,
+supports one controller-managed worker at a time, and starts when work is
+routed.
 
 The implementer reads the experimenter's report and evidence, chooses the
-best-supported fix, and creates a dedicated vLLM git worktree on a new branch.
+best-supported fix, and creates a dedicated rig git worktree on a new branch.
 It implements the fix, adds focused regression coverage, runs relevant checks,
 and leaves the worktree, complete patch, and implementation report for review.
 
-The source experiment bead and report are inputs. Existing uncommitted vLLM
-changes must be reviewed and ported deliberately into the new worktree.
-Reports distinguish proxy validation from validation on the actual model.
+The source experiment bead and report are inputs. Existing uncommitted
+changes in the rig repository must be reviewed and ported deliberately into
+the new worktree. Reports distinguish proxy validation from validation on
+the actual model.
 
 After loading the new configuration:
 
@@ -20,26 +24,27 @@ gc reload --soft
 ```
 
 Use the `implement-experiment` formula to consume a completed experiment bead.
-For the existing MiniMax-M2.5 experiment, run from the city directory:
+For example, for an existing vllm-rig experiment, run from the city directory
+(substitute `aiter` or another registered rig name as needed):
 
 ```bash
-implementation_dir=$(mktemp -d "$PWD/minimax-m2.5-implementation.XXXXXX")
-gc sling vllm/implementation.implementer implement-experiment --formula \
+scripts/gc-sling-formula.sh vllm/implementation.implementer implement-experiment \
   --var experiment_bead=vl-a1g \
-  --var artifact_dir="$implementation_dir" \
   --var base_ref=main
 ```
 
-For a direct task, create a bead in the vllm rig and include the experiment
+For a direct task, create a bead in the target rig and include the experiment
 bead ID, report path, implementation scope, base ref, and resource constraints
 in its description, then dispatch it with
-`gc sling vllm/implementation.implementer <bead-id> --no-formula`.
+`gc sling <rig>/implementation.implementer <bead-id> --no-formula`.
 
-Worktrees default to `$GC_CITY/worktrees/vllm/<implementation-step-bead-id>/`
-on branch `implement/<implementation-step-bead-id>`. Reports and patches use
-the supplied artifact directory, or default to
-`$GC_CITY/implementations/vllm/<bead-id>/` for direct tasks. The agent leaves
-changes in its worktree for review. Publication requires explicit task scope.
+Worktrees default to
+`~/dev/gc-worktrees/<rig>/<implementation-step-bead-id>/` on branch
+`implement/<implementation-step-bead-id>`. Reports and patches use the
+supplied artifact directory, or default to
+`$GC_CITY/implementations/<rig>/<bead-id>/` for direct tasks. The agent
+leaves changes in its worktree for review. Publication requires explicit
+task scope.
 
 Before editing, the implementer verifies the worktree's repository, path, and
 task branch, and saves its absolute path on the claimed bead as both `work_dir`
@@ -52,6 +57,6 @@ To validate the definition and rendered prompt:
 
 ```bash
 gc config show --validate
-gc prime vllm/implementation.implementer --strict
+gc prime <rig>/implementation.implementer --strict
 gc lint packs/implementation
 ```
