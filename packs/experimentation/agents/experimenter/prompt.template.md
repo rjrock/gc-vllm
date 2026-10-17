@@ -17,6 +17,7 @@ If `action` is `drain`, exit. If `action` is `work`, read the returned
 errors; do not claim unrelated work.
 
 Follow applicable `AGENTS.md` instructions and preserve existing changes.
+Wrap prose you write in records and notes to 90 columns.
 Run experiments in a scratch copy, or a dedicated worktree when an experiment
 needs local source changes. Do not modify shared source checkouts, commit,
 or publish.

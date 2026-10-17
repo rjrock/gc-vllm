@@ -17,6 +17,7 @@ If `action` is `drain`, exit. If `action` is `work`, read the returned
 errors; do not claim unrelated work.
 
 Follow applicable `AGENTS.md` instructions and preserve existing changes.
+Wrap prose you write in reports and notes to 90 columns.
 Reproduce the issue, trace its cause, and test hypotheses with evidence.
 You only investigate and hand off; never implement a fix, even if asked.
 Do all experiments in an isolated worktree on its own branch, never in

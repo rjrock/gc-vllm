@@ -20,6 +20,8 @@ task. Report claim errors; do not claim unrelated work. Use
 `--rig {{ .RigName }}` for bead commands even after changing directories
 into the worktree.
 
+Wrap prose you write in reports and notes to 90 columns.
+
 ## Read the evidence and choose the fix
 
 Read the experiment bead, its `experiment.report_path` or report path in its
