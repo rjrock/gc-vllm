@@ -1,0 +1,29 @@
+Running 6 items in this shard
+...F..                                                                   [100%]
+=================================== FAILURES ===================================
+______________________ test_topk_sigmoid[16-64-4-dtype1] _______________________
+
+num_experts = 16, num_tokens = 64, topk = 4, dtype = torch.bfloat16
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize(
+        "num_experts, num_tokens, topk", [(8, 4, 2), (16, 64, 4), (32, 33, 1)]
+    )
+    def test_topk_sigmoid(num_experts, num_tokens, topk, dtype):
+        torch.manual_seed(0)
+        gating_output = torch.randn(num_tokens, num_experts, dtype=dtype)
+        topk_weights = torch.zeros((num_tokens, topk), dtype=torch.float32)
+        topk_ids = torch.zeros((num_tokens, topk), dtype=torch.int32)
+    
+        topk_sigmoid(topk_weights, topk_ids, gating_output)
+        ref_weights, ref_ids = _ref_sigmoid(gating_output, topk)
+    
+>       assert torch.equal(topk_ids, ref_ids)
+E       AssertionError: assert False
+E        +  where False = <built-in method equal of type object at 0x7f72031471a0>(tensor([[11, 14, 15, 12],\n        [10,  2, 14,  1],\n        [10,  7, 13, 11],\n        [11,  4,  7, 14],\n        [ 2, 1... 9],\n        [ 3,  7,  6, 10],\n        [ 7,  6,  9, 10],\n        [ 4, 12,  1, 10]], device='cuda:0', dtype=torch.int32), tensor([[11, 14, 15, 12],\n        [10,  2, 14,  1],\n        [10,  7, 13, 11],\n        [11,  4,  7, 14],\n        [ 2, 1... 9],\n        [ 3,  7,  6, 10],\n        [ 7,  6,  9, 10],\n        [ 4, 12,  1, 10]], device='cuda:0', dtype=torch.int32))
+E        +    where <built-in method equal of type object at 0x7f72031471a0> = torch.equal
+
+/artifacts/test_topk_sigmoid.py:42: AssertionError
+=========================== short test summary info ============================
+FAILED ../artifacts/test_topk_sigmoid.py::test_topk_sigmoid[16-64-4-dtype1]
+1 failed, 5 passed in 5.63s

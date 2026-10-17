@@ -1,0 +1,392 @@
+formula = "aiter-topk_sigmoid-pybind"
+version = 1
+description = """\
+Investigate -> experiment -> implement a fix for the aiter failure 'topk_sigmoid op \
+cannot be loaded (SyntaxError from C++ type hints)' inside the vllm image \
+rjrock2/vllm-ci-ext:oct16, where the image's installed amd-aiter (0.1.25, a non-editable \
+wheel, no source tree present) is overwritten with a tip-of-tree checkout of the aiter \
+rig, installed in true editable/develop mode (python setup.py develop or pip install -e \
+.), so aiter/jit/core.py JITs kernels directly against the live source tree rather than \
+a frozen aiter_meta/ copy."""
+
+[requires]
+formula_compiler = ">=2.0.0"
+
+[vars.artifact_dir]
+description = "Absolute, shared artifact directory, unique to this workflow run."
+required = true
+pattern = "^/"
+
+[vars.formula_id]
+description = """\
+User-chosen run identifier (need not be a pre-existing bead) that groups this run's \
+artifacts under artifacts/<formula_id>/{investigate,experiment,implement}/."""
+required = true
+pattern = "^[A-Za-z0-9_.-]+$"
+
+[vars.image]
+description = """\
+Local docker image to reproduce and validate in. Already present locally (no pull \
+needed): image ID 5c69def81a47, 45.6GB. Contains an editable vllm at /root/dev/vllm (git \
+HEAD 3dc6def36088a4139182e1a79cfe9b4e5953aa8b) and a NON-editable wheel-installed \
+amd-aiter 0.1.25 at /usr/local/lib/python3.12/dist-packages/aiter (+ aiter_meta/ + \
+dist-info), installed from a wheel; /root/dev has no aiter source checkout at all. Build \
+toolchain present: hipcc (HIP 7.2.53211, ROCm 7.2.3), ninja, gcc 11.4.0, git, pybind11 \
+3.0.4, torch 2.13.0+git733fca1. Env vars baked in: AITER_ROCM_ARCH=gfx942;gfx950, \
+PYTORCH_ROCM_ARCH=gfx90a;gfx942;gfx950, ROCM_PATH=/opt/rocm."""
+default = "rjrock2/vllm-ci-ext:oct16"
+
+[vars.repo_path]
+description = """\
+Host aiter checkout (registered as the aiter rig). Read-only context for the \
+investigator; all edits happen in a dedicated rig worktree, never here."""
+default = "/home/ryrock/dev/aiter"
+pattern = "^(/.*)?$"
+
+[vars.base_ref]
+description = """\
+Optional implementation base ref. Empty means: use the aiter rig's tip-of-tree default \
+branch (main)."""
+default = ""
+
+[vars.question]
+description = "Optional extra focus or hints."
+default = ""
+
+[vars.constraints]
+description = """\
+Optional implementation focus, validation requirements, and resource limits."""
+default = ""
+
+[vars.known_context]
+description = """\
+What is already known about this failure, as unverified context to confirm, not an \
+established fact. A separate ad hoc task (bead ai-g6r, not part of this formula) already \
+produced one candidate fix; treat it as a lead to verify independently, not a given."""
+default = '''aiter's JIT binding layer (aiter/jit/core.py) validates each pybind op's
+generated docstring by exec'ing a stub built from it (`compile_ops`, ffi_type="pybind",
+the `check_args` path around aiter/jit/core.py:2296-2299: `exec(f"from aiter import*\ndef
+{doc_str}: pass", namespace)`). For `topk_sigmoid`, the pybind11 docstring for its
+torch::Tensor arguments renders as the C++ type `at::Tensor` instead of the Python type
+`torch.Tensor`, so the exec'd stub is not valid Python and raises SyntaxError at JIT-load
+time -- the op can never be bound or called.
+`csrc/pybind/moe_topk_ck_pybind.cu` includes `<torch/all.h>` (the pure C++ frontend
+only), not `<torch/extension.h>` (which also pulls in torch/csrc/utils/pybind.h, the
+pybind11 `at::Tensor` <-> `torch.Tensor` type_caster that produces the correct
+Python-facing docstring). Sibling pybind translation units in the codebase (for example
+csrc/pybind/mha_v4_fwd_pybind.cu) already pull in torch/extension.h for this reason --
+this is the established pattern elsewhere in the codebase for torch-pybind TUs that need
+the Tensor caster.
+A known-candidate, unverified fix: change that one include in
+csrc/pybind/moe_topk_ck_pybind.cu from torch/all.h to torch/extension.h, so the generated
+docstring reads torch.Tensor and the exec() validation in aiter/jit/core.py's check_args
+succeeds. A prior, less rigorous ad hoc task validated a version of this fix only via
+PYTHONPATH injection of a worktree over the image's site-packages (not a true editable
+package overwrite); that task's bead and worktree are not part of this workflow's inputs
+and must not be read, reused, or assumed correct -- re-derive and re-validate everything
+from this workflow's own evidence.'''
+
+[vars.editable_mode_notes]
+description = """\
+How aiter distinguishes a true editable/develop install from a frozen wheel install, and \
+what the investigator/experimenter/implementer must use to overwrite and verify it."""
+default = '''aiter's setup.py decides packaging mode from argv: `is_develop_mode()`
+(setup.py) is True when invoked as `python setup.py develop` or with any arg containing
+"editable" (i.e. `pip install -e .`). `write_install_mode()` then writes a plain-text file
+`<aiter-package-dir>/install_mode` containing literally `develop` or `install`.
+For a REGULAR (non-develop) install, `prepare_packaging()` copies 3rdparty/, hsa/,
+gradlib/, csrc/ into a separate `aiter_meta/` tree next to the installed package and
+strips .gitignored asm dumps; develop mode skips this entirely (no aiter_meta copy is
+made).
+At import time, aiter/jit/core.py reads `{this_dir}/../install_mode`: if its content is
+"develop", `AITER_META_DIR` is set to `AITER_ROOT_DIR` (the source tree itself, used
+directly for JIT builds -- true editable mode); otherwise `AITER_META_DIR` is the
+separate `aiter_meta/` copy. A missing install_mode file defaults to develop-mode
+behavior.
+To genuinely put the image's aiter into editable/develop mode against a tip-of-tree
+checkout: get a tip-of-tree aiter source tree into the container (bind mount the rig
+worktree, read-write -- aiter's JIT writes build artifacts back into its own source tree
+at runtime, so a read-only mount silently breaks this), uninstall/remove the existing
+non-editable amd-aiter wheel install (package dir, aiter_meta/, and its dist-info) from
+site-packages, then run `python setup.py develop` (or `pip install -e .`, which
+additionally needs `./.github/scripts/install_triton.sh` per aiter's CONTRIBUTE.md for
+the full Python+HIP/CK kernel path) FROM the mounted worktree. Verify genuine editable
+mode by: (a) `python -c "import aiter; print(aiter.__file__)"` resolving inside the
+mounted worktree, not dist-packages; (b) the worktree's own `aiter/install_mode` file
+(not a copy) reading "develop"; (c) confirming no `aiter_meta/` tree was created/used --
+JIT builds must read source directly from the mounted worktree root.'''
+
+[vars.gpu_rules]
+description = "Rules for using the local GPUs safely."
+default = '''LOCAL GPU RULES (this host has 8 MI300X GPUs, shared with other users).
+1. Use ONE GPU per container. Before every launch run `rocm-smi --showuse` and
+   `rocm-smi --showmeminfo vram`; pick a GPU with 0% use and ~no VRAM held.
+   Never use a busy GPU. Record the index in your report. Importing aiter
+   without real GPU access (no --device mapping) fails with "RuntimeError: No
+   gfx arch found in rocminfo output" -- this is expected and not itself a bug;
+   always run with real device access for anything beyond a plain syntax check.
+2. Run containers with `--device=/dev/kfd --device=/dev/dri --group-add video
+   --security-opt seccomp=unconfined --ipc=host --shm-size=16g` and
+   `-e HIP_VISIBLE_DEVICES=<idx>`, name them with your claimed bead ID, use
+   `--entrypoint bash` (the image entrypoint is not a shell), and `docker rm -f`
+   them when done, on every error path.
+3. aiter JIT-compiles kernels on first use and can take minutes; allow for it.
+   Keep each experiment's JIT cache isolated (a per-bead cache directory) to
+   avoid cross-experiment contamination, and note whether a clean/cold JIT
+   cache changes the result, since this bug is itself in the JIT-binding
+   generation path.
+4. Do not modify the image. Do not run `docker commit` over `{{image}}`. The
+   editable-mode overwrite this task requires happens by bind-mounting a
+   writable tip-of-tree aiter worktree into the container and running the
+   install there, at container-run time; the underlying image is never
+   altered. Mount the worktree READ-WRITE (never `:ro`): aiter's JIT writes
+   generated build artifacts back into its own source tree, and a read-only
+   mount silently breaks editable-mode JIT builds (this exact failure mode --
+   falling back to a different, non-worktree JIT cache -- has been hit before
+   in unrelated work; do not repeat it).
+5. Disk: `/`, `/tmp`, `/root` share one overlay filesystem on this host (about
+   3.5T total; check `df -h` before large builds).'''
+
+[[steps]]
+id = "body"
+title = """\
+Investigate, experiment, and fix the aiter topk_sigmoid JIT SyntaxError using an \
+editable tip-of-tree aiter inside rjrock2/vllm-ci-ext:oct16"""
+needs = ["implement"]
+
+[steps.metadata]
+"gc.kind" = "scope"
+"gc.scope_name" = "aiter-topk_sigmoid-pybind"
+"gc.scope_role" = "body"
+
+[[steps]]
+id = "investigate"
+title = """\
+Investigate the topk_sigmoid JIT-binding SyntaxError with aiter overwritten into \
+editable tip-of-tree mode"""
+description = """
+Investigate the failure: AITER's `topk_sigmoid` op cannot be loaded, raising a
+`SyntaxError` from JIT-generated C++-style type hints (`at::Tensor`) exec'd as
+Python. This workflow requires you to first overwrite the target image's
+installed aiter with a tip-of-tree checkout in true editable/develop mode, and
+reproduce/diagnose the bug against THAT editable install, not against the
+image's stock wheel install and not via a lighter-weight PYTHONPATH injection.
+
+Context, as unverified claims to confirm (not established facts):
+
+{{known_context}}
+
+How aiter's editable/develop mode works, and how to put the image's aiter into
+it against a tip-of-tree checkout:
+
+{{editable_mode_notes}}
+
+Environment: use the local docker image `{{image}}` (already present locally;
+do not pull). Resolve the aiter rig's source repository and tip-of-tree commit
+using `gc rig list --json` (registered path hint: {{repo_path}}); do not
+assume this hint is accurate without verifying it against the rig registration.
+
+{{gpu_rules}}
+
+Additional focus or hints: {{question}}
+
+Diagnose only; follow your agent's isolation rules and do not implement a fix
+in this step. Do the editable-mode overwrite in your own isolated worktree
+(never the shared aiter checkout), on its own branch, per your pack's worktree
+protocol, and bind-mount that worktree read-write into the container to
+perform the `setup.py develop` (or `pip install -e .`) overwrite and all
+testing. Confirm genuine editable mode (aiter.__file__ location, install_mode
+file content, absence of a used aiter_meta/ tree) before treating any
+reproduction as valid. Reproduce the smallest failing case first (e.g. a
+direct Python call that imports aiter and invokes topk_sigmoid, outside any
+larger test suite), and read aiter/jit/core.py's docstring-exec validation
+path and csrc/pybind/moe_topk_ck_pybind.cu's pybind declaration to confirm
+exactly which include/type-caster is missing and why the generated docstring
+renders `at::Tensor` instead of `torch.Tensor`.
+
+Use `{{artifact_dir}}` as the shared directory for this run. Write your
+artifacts under `{{artifact_dir}}/investigate/`, creating that subdirectory
+if needed; it must not contain an earlier run's reports. Do not overwrite
+existing files.
+
+Before closing this step, write `{{artifact_dir}}/investigate/investigation.md` with:
+- Your claimed bead ID, the aiter tip-of-tree commit used, and date.
+- The exact reproduction command, container name/flags, GPU index, environment
+  variables, versions; mark missing information.
+- The exact steps used to overwrite the image's aiter with the editable
+  tip-of-tree checkout (worktree path/branch, mount flags, install command run
+  inside the container, and the three editable-mode verification checks and
+  their results).
+- Fresh findings with file:line references (in the aiter worktree) and raw
+  output paths. Separate fresh observations from the supplied context and from
+  untested hypotheses.
+- Ranked root-cause hypotheses with confidence, alternatives, and missing
+  evidence.
+- A minimal experiment plan for the experimenter: hypothesis, prediction,
+  control, exact commands, distinguishing result.
+
+Append the handoff summary and absolute report path to this claimed step's
+notes with `gc bd update <claimed-bead-id> --append-notes <text>` and record
+`--set-metadata investigation.report_path=<path>`. Verify the report is
+readable, then set `gc.outcome=pass` on this claimed step and close only it.
+
+If blocked (image missing, no idle GPU, cannot produce a usable handoff),
+append the reason, set `gc.outcome=fail` and `gc.failure_reason=<reason>`, and
+close only this step. Do not close the workflow root.
+"""
+
+[steps.metadata]
+"gc.run_target" = "aiter/investigation.investigator"
+"gc.scope_ref" = "body"
+"gc.scope_role" = "member"
+"gc.on_fail" = "abort_scope"
+
+[[steps]]
+id = "experiment"
+title = """\
+Validate the topk_sigmoid editable-mode investigation with minimal \
+experiments"""
+needs = ["investigate"]
+description = """
+Read `{{artifact_dir}}/investigate/investigation.md` before running anything. Read the
+producer bead ID recorded in it, and verify it belongs to the same
+`gc.root_bead_id` as your claimed step and has `gc.outcome=pass`. Test
+environment: docker image `{{image}}`.
+
+{{gpu_rules}}
+
+Additional focus or hints: {{question}}
+
+Test the handoff's hypotheses; do not assume its conclusions are correct,
+including whether its claimed editable-mode overwrite is genuinely in effect
+-- re-verify it yourself (aiter.__file__, install_mode file content, no
+aiter_meta/ tree in use) before trusting any reproduction built on top of it.
+Follow your six-step protocol for every experiment: hypothesis, prediction
+(recorded before running), exact command/environment, run, actual result,
+verdict (supports / contradicts / inconclusive). Prefer the smallest
+experiments that separate the hypotheses, for example:
+- Confirm the SyntaxError reproduces against the editable tip-of-tree aiter
+  overwrite (not the image's stock wheel) by calling `topk_sigmoid` directly
+  in a minimal script outside any larger test harness.
+- Inspect the generated docstring/exec'd stub that fails (from
+  aiter/jit/core.py's check_args path) and confirm it contains `at::Tensor`
+  rather than `torch.Tensor`, tying it to the specific pybind declaration in
+  csrc/pybind/moe_topk_ck_pybind.cu.
+- Test the candidate fix (or any fix direction the investigation recommends)
+  by editing the pybind translation unit's includes in your experiment
+  worktree, rebuilding the JIT extension in place (confirming the editable
+  install picks up the change directly -- no reinstall should be needed in
+  true develop mode), and confirming `topk_sigmoid` now loads and the
+  SyntaxError is gone; include a control showing the unmodified worktree still
+  fails identically.
+- If feasible, run `topk_sigmoid` end-to-end (compare output against a
+  sigmoid+topk reference implementation) to confirm the fix doesn't just
+  silence the SyntaxError but produces a correctly bound, correctly behaving
+  op.
+
+Save experiment records and raw output under `{{artifact_dir}}/experiment/`
+(creating it if needed) and write `{{artifact_dir}}/experiment/experiments.md`
+with the producer bead ID, every experiment's six steps, evidence paths,
+verdicts, uncertainties, and a recommended fix direction naming the source
+file(s), the change, and the tested revision. Do not implement the
+production fix in the shared aiter checkout; candidate edits belong only in
+your own experiment worktree.
+
+Append the summary and absolute artifact paths to this claimed step's notes
+with `gc bd update <claimed-bead-id> --append-notes <text>`, set
+`experiment.report_path=<path>` and `gc.outcome=pass`, and close only this
+step. `pass` means the experiments were completed, even if a hypothesis is
+contradicted or inconclusive.
+
+If the handoff is missing, stale, or unusable, or runtime resources prevent
+execution, record the blocker, set `gc.outcome=fail` and
+`gc.failure_reason=<reason>`, and close only this step. Do not fabricate
+results or close earlier steps or the workflow root.
+"""
+
+[steps.metadata]
+"gc.run_target" = "aiter/experimentation.experimenter"
+"gc.scope_ref" = "body"
+"gc.scope_role" = "member"
+"gc.on_fail" = "abort_scope"
+
+[[steps]]
+id = "implement"
+title = """\
+Implement, validate, and commit the aiter fix, keeping tip-of-tree editable \
+mode as the validation environment"""
+needs = ["experiment"]
+description = """
+Read `{{artifact_dir}}/experiment/experiments.md`, the producer experiment bead, and the
+investigation artifacts it cites. Verify the investigation and experiment step
+beads belong to your `gc.root_bead_id`, completed with `gc.outcome=pass`, and
+recorded the report paths you are reading; record their IDs and paths on your
+claimed step.
+
+Additional scope and resource constraints: {{constraints}}
+
+{{gpu_rules}}
+
+Choose the smallest coherent root-cause fix supported by the experiments, and
+explain why it preserves existing behavior for other pybind ops in the
+codebase (do not change aiter/jit/core.py's docstring-exec validation itself
+to work around this one op; fix the declaration that produces the bad
+docstring, unless the experiments justify otherwise). The owning repository is
+the aiter rig (registered path hint {{repo_path}}; resolve the authoritative
+path via `gc rig list --json`). Optional base-ref override: {{base_ref}}. If
+empty, use the aiter rig's tip-of-tree default branch.
+
+Follow your worktree protocol. Record the shared aiter checkout's dirty state,
+branch/HEAD, and protected main/default-branch refs. Create/recover the linked
+worktree `$GC_CITY/worktrees/aiter/<claimed-bead-id>` on branch
+`implement/<claimed-bead-id>`, verifying repository, path, ownership, and
+branch before any edit. Save its absolute path as `work_dir` and
+`implementation.worktree_path`, and record `implementation.branch` and
+`implementation.base_commit`. All edits, builds, tests, staging, and commits
+happen there. Never modify the shared checkout, never advance main, never edit
+the docker image.
+
+Implement the fix with focused regression coverage. Validate by overwriting
+`{{image}}`'s installed aiter with YOUR implementation worktree in true
+editable/develop mode (bind-mounted read-write, `python setup.py develop` or
+`pip install -e .` run inside the container against the worktree; verify
+genuine editable mode via aiter.__file__, the worktree's own install_mode file
+reading "develop", and no aiter_meta/ tree in use -- do not rely on a
+PYTHONPATH-only injection, which does not exercise a true package overwrite):
+1. The original failure on the baseline (fresh reproduction against the
+   editable overwrite before your fix is applied in the worktree).
+2. The previously-failing `topk_sigmoid` call succeeding after your fix,
+   including a correctness check against a reference implementation, not just
+   absence of the SyntaxError.
+3. A representative sample of any existing aiter test coverage for topk ops,
+   plus the repository's required lint/pre-commit hooks on changed files.
+Report which results are proxy-only (for example, limited GPU archs or only a
+new regression test, no broader suite run) and what remains untested.
+
+After validation passes, recheck the worktree and branch, stage only intended
+files by explicit path, inspect the staged diff, run `git diff --cached
+--check`, and commit on `implement/<claimed-bead-id>` following the repo's
+commit/DCO/hook rules. Never bypass failing hooks. Record the full hash as
+`implementation.commit_hash`. Do not merge, push, or open a PR.
+
+Use `{{artifact_dir}}/implement/` for this run's artifacts (creating it if
+needed). Write `{{artifact_dir}}/implement/implementation.md` (source/producer
+IDs, fix and rationale, repository, worktree/branch/base/fix commits, the
+editable-mode overwrite and verification steps used for validation, validation
+commands and results, limitations, artifact paths) and export
+`{{artifact_dir}}/implement/implementation.patch` with `git diff --binary
+<base-commit> <fix-commit>`. Append the summary and paths to your claimed bead, set
+`implementation.report_path`, `implementation.patch_path`,
+`implementation.commit_hash`, and `gc.outcome=pass`, then close only your step.
+
+If no justified fix exists, required validation is unavailable, or committing
+fails, write a partial report with blockers, preserve worktree progress, set
+`gc.outcome=fail` and `gc.failure_reason`, and close only your step. Do not
+close earlier steps or the workflow root.
+"""
+
+[steps.metadata]
+"gc.run_target" = "aiter/implementation.implementer"
+"gc.scope_ref" = "body"
+"gc.scope_role" = "member"
+"gc.on_fail" = "abort_scope"

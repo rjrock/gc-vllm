@@ -1,0 +1,12 @@
+[aiter] import [module_aiter_core] under /workspace/aiter/aiter/jit/module_aiter_core.so
+[aiter] [pid=1072 pname=MainProcess] start build [module_moe_topk_ck] under /workspace/aiter/aiter/jit/build/module_moe_topk_ck
+[aiter] Current hipcc not support: -mllvm -amdgpu-coerce-illegal-types=1, skip it.
+[aiter] [pid=1072 pname=MainProcess] [32mfinish build [module_moe_topk_ck], cost 38.0s [0m
+[aiter] import [module_moe_topk_ck] under /workspace/aiter/aiter/jit/module_moe_topk_ck.so
+OK tensor([[0., 0.],
+        [0., 0.],
+        [0., 0.],
+        [0., 0.]], device='cuda:0') tensor([[0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0]], device='cuda:0', dtype=torch.int32)

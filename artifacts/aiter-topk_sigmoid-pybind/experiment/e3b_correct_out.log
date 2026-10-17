@@ -1,0 +1,11 @@
+[aiter] import [module_aiter_core] under /workspace/aiter/aiter/jit/module_aiter_core.so
+[aiter] import [module_moe_topk_ck] under /workspace/aiter/aiter/jit/module_moe_topk_ck.so
+torch.float16 (4, 16, 2) idx_ok True w_ok True
+torch.float16 (32, 64, 4) idx_ok True w_ok True
+torch.float16 (128, 128, 8) idx_ok False w_ok False
+torch.float16 (33, 32, 1) idx_ok True w_ok True
+torch.bfloat16 (4, 16, 2) idx_ok True w_ok True
+torch.bfloat16 (32, 64, 4) idx_ok False w_ok False
+torch.bfloat16 (128, 128, 8) idx_ok False w_ok False
+torch.bfloat16 (33, 32, 1) idx_ok True w_ok True
+ALL_OK False

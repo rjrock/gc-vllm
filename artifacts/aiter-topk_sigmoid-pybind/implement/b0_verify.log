@@ -1,0 +1,11 @@
+[aiter] [pid=260 pname=MainProcess] start build [module_aiter_core] under /workspace/aiter/aiter/jit/build/module_aiter_core
+[aiter] Current hipcc not support: -mllvm -amdgpu-coerce-illegal-types=1, skip it.
+[aiter] [pid=260 pname=MainProcess] [32mfinish build [module_aiter_core], cost 20.8s [0m
+[aiter] import [module_aiter_core] under /workspace/aiter/aiter/jit/module_aiter_core.so
+/workspace/aiter/aiter/__init__.py
+develop
+ls: cannot access '/workspace/aiter/aiter_meta': No such file or directory
+ls: cannot access '/usr/local/lib/python*/dist-packages/aiter_meta': No such file or directory
+Location: /workspace/aiter
+Editable project location: /workspace/aiter
+fatal: not a git repository: /home/ryrock/dev/aiter/.git/worktrees/ai-sd4

@@ -1,0 +1,3 @@
+[aiter] import [module_aiter_core] under /workspace/aiter/aiter/jit/module_aiter_core.so
+[aiter] import [module_moe_topk_ck] under /workspace/aiter/aiter/jit/module_moe_topk_ck.so
+'topk_sigmoid(topk_weights: at::Tensor, topk_indices: at::Tensor, gating_output: at::Tensor) -> None\n\nApply topk sigmoid to the gating outputs.\n'

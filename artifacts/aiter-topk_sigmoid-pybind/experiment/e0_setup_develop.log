@@ -1,0 +1,178 @@
+Found existing installation: amd-aiter 0.1.25
+Uninstalling amd-aiter-0.1.25:
+  Successfully uninstalled amd-aiter-0.1.25
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+Collecting flydsl==0.4.0
+  Downloading flydsl-0.4.0-cp312-cp312-manylinux_2_27_x86_64.whl.metadata (18 kB)
+Downloading flydsl-0.4.0-cp312-cp312-manylinux_2_27_x86_64.whl (76.7 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 76.7/76.7 MB 120.9 MB/s  0:00:00
+Installing collected packages: flydsl
+  Attempting uninstall: flydsl
+    Found existing installation: flydsl 0.3.4.1
+    Uninstalling flydsl-0.3.4.1:
+      Successfully uninstalled flydsl-0.3.4.1
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+Successfully installed flydsl-0.4.0
+Found existing installation: triton 3.8.0+git669b31ac
+Uninstalling triton-3.8.0+git669b31ac:
+  Successfully uninstalled triton-3.8.0+git669b31ac
+WARNING: Skipping pytorch-triton as it is not installed.
+WARNING: Skipping pytorch-triton-rocm as it is not installed.
+WARNING: Skipping triton-rocm as it is not installed.
+WARNING: Skipping amd-triton as it is not installed.
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+WARNING: Skipping triton-kernels as it is not installed.
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+Installing triton from https://pypi.amd.com/triton/release_0914/rocm-7.2.0/simple/
+Looking in indexes: https://pypi.org/simple, https://pypi.amd.com/triton/release_0914/rocm-7.2.0/simple/
+Collecting triton==3.8.0
+  Downloading triton-3.8.0%2Bamd.rocm7.2.0.git7cb7b059-cp312-cp312-linux_x86_64.whl (482.5 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 482.5/482.5 MB 58.5 MB/s  0:00:08
+Installing collected packages: triton
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+Successfully installed triton-3.8.0+amd.rocm7.2.0.git7cb7b059
+Installing triton-kernels from https://pypi.amd.com/triton/release_0914/rocm-7.2.0/simple/
+Looking in indexes: https://pypi.org/simple, https://pypi.amd.com/triton/release_0914/rocm-7.2.0/simple/
+Collecting triton-kernels==1.0.0
+  Downloading triton_kernels-1.0.0%2Bamd.rocm7.2.0.git7cb7b059-py3-none-any.whl (148 kB)
+Requirement already satisfied: numpy in /usr/local/lib/python3.12/dist-packages (from triton-kernels==1.0.0) (2.2.6)
+Requirement already satisfied: pytest in /usr/local/lib/python3.12/dist-packages (from triton-kernels==1.0.0) (9.1.0)
+Requirement already satisfied: iniconfig>=1.0.1 in /usr/local/lib/python3.12/dist-packages (from pytest->triton-kernels==1.0.0) (2.3.0)
+Requirement already satisfied: packaging>=22 in /usr/local/lib/python3.12/dist-packages (from pytest->triton-kernels==1.0.0) (26.2)
+Requirement already satisfied: pluggy<2,>=1.5 in /usr/local/lib/python3.12/dist-packages (from pytest->triton-kernels==1.0.0) (1.6.0)
+Requirement already satisfied: pygments>=2.7.2 in /usr/local/lib/python3.12/dist-packages (from pytest->triton-kernels==1.0.0) (2.21.0)
+Installing collected packages: triton-kernels
+Successfully installed triton-kernels-1.0.0+amd.rocm7.2.0.git7cb7b059
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+Installed triton 3.8.0
+/usr/local/lib/python3.12/dist-packages/setuptools/__init__.py:94: _DeprecatedInstaller: setuptools.installer and fetch_build_eggs are deprecated.
+!!
+
+        ********************************************************************************
+        Requirements should be satisfied by a PEP 517 installer.
+        If you are using pip, you can try `pip install --use-pep517`.
+        ********************************************************************************
+
+!!
+  dist.fetch_build_eggs(dist.setup_requires)
+/usr/local/lib/python3.12/dist-packages/setuptools/dist.py:759: SetuptoolsDeprecationWarning: License classifiers are deprecated.
+!!
+
+        ********************************************************************************
+        Please consider removing the following classifiers in favor of a SPDX license expression:
+
+        License :: OSI Approved :: BSD License
+
+        See https://packaging.python.org/en/latest/guides/writing-pyproject-toml/#license for details.
+        ********************************************************************************
+
+!!
+  self._finalize_license_expression()
+/usr/local/lib/python3.12/dist-packages/setuptools/command/develop.py:41: EasyInstallDeprecationWarning: easy_install command is deprecated.
+!!
+
+        ********************************************************************************
+        Please avoid running ``setup.py`` and ``easy_install``.
+        Instead, use pypa/build, pypa/installer or other
+        standards-based tools.
+
+        See https://github.com/pypa/setuptools/issues/917 for details.
+        ********************************************************************************
+
+!!
+  easy_install.initialize_options(self)
+[aiter] Replacing existing triton==3.8.0+git669b31ac with aiter-compatible triton (if needed, set AITER_USE_SYSTEM_TRITON=1 to keep your triton)
+[aiter] Installing triton via .github/scripts/install_triton.sh
+running develop
+/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/cmd.py:90: SetuptoolsDeprecationWarning: setup.py install is deprecated.
+!!
+
+        ********************************************************************************
+        Please avoid running ``setup.py`` directly.
+        Instead, use pypa/build, pypa/installer or other
+        standards-based tools.
+
+        See https://blog.ganssle.io/articles/2021/10/setup-py-deprecated.html for details.
+        ********************************************************************************
+
+!!
+  self.initialize_options()
+running egg_info
+creating amd_aiter.egg-info
+writing amd_aiter.egg-info/PKG-INFO
+writing dependency_links to amd_aiter.egg-info/dependency_links.txt
+writing requirements to amd_aiter.egg-info/requires.txt
+writing top-level names to amd_aiter.egg-info/top_level.txt
+writing manifest file 'amd_aiter.egg-info/SOURCES.txt'
+[10/16/26 23:10:38] WARNING  file discovery is suppressed        __init__.py:178
+                             because version inference found no                 
+                             SCM checkout, but .git exists in                   
+                             /workspace/aiter -- the built                      
+                             distribution may be missing files                  
+                             tracked by that checkout                           
+reading manifest file 'amd_aiter.egg-info/SOURCES.txt'
+reading manifest template 'MANIFEST.in'
+warning: no directories found matching 'aiter_meta'
+no previously-included directories found matching 'aiter/jit/build'
+adding license file 'LICENSE'
+writing manifest file 'amd_aiter.egg-info/SOURCES.txt'
+running build_ext
+Creating /usr/local/lib/python3.12/dist-packages/amd-aiter.egg-link (link to .)
+Adding amd-aiter 0.1.0 to easy-install.pth file
+
+Installed /workspace/aiter
+Processing dependencies for amd-aiter==0.1.0
+Searching for flydsl==0.4.0
+Best match: flydsl 0.4.0
+Adding flydsl 0.4.0 to easy-install.pth file
+
+Using /usr/local/lib/python3.12/dist-packages
+Searching for packaging==26.2
+Best match: packaging 26.2
+Adding packaging 26.2 to easy-install.pth file
+
+Using /usr/local/lib/python3.12/dist-packages
+Searching for psutil==7.2.2
+Best match: psutil 7.2.2
+Adding psutil 7.2.2 to easy-install.pth file
+
+Using /usr/local/lib/python3.12/dist-packages
+Searching for einops==0.8.2
+Best match: einops 0.8.2
+Adding einops 0.8.2 to easy-install.pth file
+
+Using /usr/local/lib/python3.12/dist-packages
+Searching for pandas==3.0.1
+Best match: pandas 3.0.1
+Adding pandas 3.0.1 to easy-install.pth file
+
+Using /usr/local/lib/python3.12/dist-packages
+Searching for ninja==1.13.0
+Best match: ninja 1.13.0
+Adding ninja 1.13.0 to easy-install.pth file
+
+Using /usr/local/lib/python3.12/dist-packages
+Searching for pybind11==3.0.4
+Best match: pybind11 3.0.4
+Adding pybind11 3.0.4 to easy-install.pth file
+Installing pybind11-config script to /usr/local/bin
+
+Using /usr/local/lib/python3.12/dist-packages
+Searching for python-dateutil==2.9.0.post0
+Best match: python-dateutil 2.9.0.post0
+Adding python-dateutil 2.9.0.post0 to easy-install.pth file
+
+Using /usr/local/lib/python3.12/dist-packages
+Searching for numpy==2.2.6
+Best match: numpy 2.2.6
+Adding numpy 2.2.6 to easy-install.pth file
+Installing f2py script to /usr/local/bin
+Installing numpy-config script to /usr/local/bin
+
+Using /usr/local/lib/python3.12/dist-packages
+Searching for six==1.17.0
+Best match: six 1.17.0
+Adding six 1.17.0 to easy-install.pth file
+
+Using /usr/local/lib/python3.12/dist-packages
+Finished processing dependencies for amd-aiter==0.1.0

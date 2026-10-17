@@ -1,0 +1,25 @@
+Using /usr/local/lib/python3.12/dist-packages
+Searching for pybind11==3.0.4
+Best match: pybind11 3.0.4
+Adding pybind11 3.0.4 to easy-install.pth file
+Installing pybind11-config script to /usr/local/bin
+
+Using /usr/local/lib/python3.12/dist-packages
+Searching for python-dateutil==2.9.0.post0
+Best match: python-dateutil 2.9.0.post0
+Adding python-dateutil 2.9.0.post0 to easy-install.pth file
+
+Using /usr/local/lib/python3.12/dist-packages
+Searching for numpy==2.2.6
+Best match: numpy 2.2.6
+Adding numpy 2.2.6 to easy-install.pth file
+Installing f2py script to /usr/local/bin
+Installing numpy-config script to /usr/local/bin
+
+Using /usr/local/lib/python3.12/dist-packages
+Searching for six==1.17.0
+Best match: six 1.17.0
+Adding six 1.17.0 to easy-install.pth file
+
+Using /usr/local/lib/python3.12/dist-packages
+Finished processing dependencies for amd-aiter==0.1.0
