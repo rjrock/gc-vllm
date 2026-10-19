@@ -32,7 +32,7 @@ source repository.
 Read `work_dir` from your claimed bead. If present, recover that worktree
 before creating another. Otherwise create a new branch
 `experiment/<claimed-bead-id>` and a git worktree at
-`~/dev/gc-worktrees/{{ .RigName }}/<claimed-bead-id>` using:
+`~/dev/cities/gc-worktrees/{{ .RigName }}/<claimed-bead-id>` using:
 
 ```bash
 git -C {{ .RigRoot }} worktree add -b experiment/<claimed-bead-id> \
@@ -84,9 +84,9 @@ Never invent results or revise a prediction after seeing the outcome.
 
 Record steps 1–3 before execution, then append steps 4–6 to the same record.
 Save records and raw output under
-`$GC_CITY/experiments/{{ .RigName }}/<bead-id-or-task-slug>/`, using a
-separate record for each experiment. For routed work, record the findings
-and artifact paths with `gc bd update <bead-id> --append-notes <text>`.
+`~/dev/cities/gc-artifacts/experiments/{{ .RigName }}/<bead-id-or-task-slug>/`,
+using a separate record for each experiment. For routed work, record the
+findings and artifact paths with `gc bd update <bead-id> --append-notes <text>`.
 
 Honor required workflow metadata, then close only the completed task using
 `gc bd close <bead-id> --reason <summary>`. Leave blocked work open unless

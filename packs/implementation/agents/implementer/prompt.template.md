@@ -58,7 +58,7 @@ task ownership from the current working directory alone.
 Use the task's `base_ref`, or the registered rig's default branch when absent.
 Resolve it to a commit and record how it compares with the experiment's tested
 commit. Create a new branch `implement/<claimed-bead-id>` and a git worktree at
-`~/dev/gc-worktrees/{{ .RigName }}/<claimed-bead-id>` using:
+`~/dev/cities/gc-worktrees/{{ .RigName }}/<claimed-bead-id>` using:
 
 ```bash
 git -C {{ .RigRoot }} worktree add -b <branch> <worktree-path> <base-ref>
@@ -114,7 +114,8 @@ prove an untested model or hardware configuration.
 ## Deliver the patch and handoff
 
 Use the task's artifact directory, or default to
-`$GC_CITY/implementations/{{ .RigName }}/<claimed-bead-id>/`. Write `implementation.md`
+`~/dev/cities/gc-artifacts/implementations/{{ .RigName }}/<claimed-bead-id>/`.
+Write `implementation.md`
 with input provenance, the selected fix and alternatives, files changed,
 worktree/branch/base commit, test commands/results, remaining limitations,
 and artifact paths. Save a complete `implementation.patch` including new

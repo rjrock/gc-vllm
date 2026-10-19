@@ -39,12 +39,12 @@ in its description, then dispatch it with
 `gc sling <rig>/implementation.implementer <bead-id> --no-formula`.
 
 Worktrees default to
-`~/dev/gc-worktrees/<rig>/<implementation-step-bead-id>/` on branch
+`~/dev/cities/gc-worktrees/<rig>/<implementation-step-bead-id>/` on branch
 `implement/<implementation-step-bead-id>`. Reports and patches use the
 supplied artifact directory, or default to
-`$GC_CITY/implementations/<rig>/<bead-id>/` for direct tasks. The agent
-leaves changes in its worktree for review. Publication requires explicit
-task scope.
+`~/dev/cities/gc-artifacts/implementations/<rig>/<bead-id>/` for direct
+tasks. The agent leaves changes in its worktree for review. Publication
+requires explicit task scope.
 
 Before editing, the implementer verifies the worktree's repository, path, and
 task branch, and saves its absolute path on the claimed bead as both `work_dir`

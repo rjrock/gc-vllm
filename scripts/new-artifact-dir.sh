@@ -9,11 +9,13 @@ fi
 formula="$1"
 formula_id="${2:-}"
 
+artifacts_root="$HOME/dev/cities/gc-artifacts"
+
 if [ -n "$formula_id" ]; then
-  dir="$PWD/artifacts/$formula_id"
+  dir="$artifacts_root/$formula_id"
   mkdir -p "$dir/investigate" "$dir/experiment" "$dir/implement"
   echo "$dir"
 else
-  mkdir -p "artifacts/$formula"
-  mktemp -d "$PWD/artifacts/$formula/run.XXXXXX"
+  mkdir -p "$artifacts_root/$formula"
+  mktemp -d "$artifacts_root/$formula/run.XXXXXX"
 fi
