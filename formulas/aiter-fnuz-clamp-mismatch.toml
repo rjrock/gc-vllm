@@ -1,0 +1,432 @@
+formula = "aiter-fnuz-clamp-mismatch"
+version = 1
+description = """\
+Investigate -> experiment -> implement a fix for the vllm/aiter FP8 static per-tensor \
+quantization clamp mismatch on float8_e4m3fnuz (gfx942): aiter's \
+`static_per_tensor_quant` kernel (reached via `QuantFP8.forward_hip` when \
+VLLM_ROCM_USE_AITER(_LINEAR)=1) saturates at +-240, while vLLM's own \
+`get_fp8_min_max` convention and its MLA decode-path consumers (e.g. \
+`_DecodeConcatQuantFP8`) expect +-224, producing incorrect quantized output (e.g. max \
+abs diff 16.0) whenever |x/scale| exceeds 224. This workflow requires rebuilding the \
+target image's installed aiter from a tip-of-tree checkout in true editable/develop \
+mode before diagnosing, experimenting, or validating, so the aiter kernel under test \
+is current source, not a frozen wheel."""
+
+[requires]
+formula_compiler = ">=2.0.0"
+
+[vars.artifact_dir]
+description = "Absolute, shared artifact directory, unique to this workflow run."
+required = true
+pattern = "^/"
+
+[vars.image]
+description = """\
+Local docker image to reproduce and validate in. Already present locally (no pull \
+needed): image ID 5c69def81a47, 45.6GB. Contains an editable vllm at /root/dev/vllm (git \
+HEAD 3dc6def36088a4139182e1a79cfe9b4e5953aa8b) and a NON-editable wheel-installed \
+amd-aiter 0.1.25 at /usr/local/lib/python3.12/dist-packages/aiter (+ aiter_meta/ + \
+dist-info), installed from a wheel; /root/dev has no aiter source checkout at all. Build \
+toolchain present: hipcc (HIP 7.2.53211, ROCm 7.2.3), ninja, gcc 11.4.0, git, pybind11 \
+3.0.4, torch 2.13.0+git733fca1. Env vars baked in: AITER_ROCM_ARCH=gfx942;gfx950, \
+PYTORCH_ROCM_ARCH=gfx90a;gfx942;gfx950, ROCM_PATH=/opt/rocm."""
+default = "rjrock2/vllm-ci-ext:oct16"
+
+[vars.vllm_repo_path]
+description = """\
+Host vllm checkout (registered as the vllm rig). Read-only context; the fix lands in a \
+dedicated rig worktree, never here."""
+default = "/home/ryrock/dev/vllm"
+pattern = "^(/.*)?$"
+
+[vars.aiter_repo_path]
+description = """\
+Host aiter checkout (registered as the aiter rig), used only to source a tip-of-tree \
+checkout for the editable rebuild. Read-only context; the rebuild happens in a \
+dedicated, disposable worktree, never here, and nothing is ever committed to the aiter \
+rig as part of this formula."""
+default = "/home/ryrock/dev/aiter"
+pattern = "^(/.*)?$"
+
+[vars.base_ref]
+description = """\
+Optional implementation base ref for the vllm fix. Empty means: use the vllm rig's \
+tip-of-tree default branch (main)."""
+default = ""
+
+[vars.question]
+description = "Optional extra focus or hints."
+default = ""
+
+[vars.constraints]
+description = """\
+Optional implementation focus, validation requirements, and resource limits."""
+default = ""
+
+[vars.known_context]
+description = """\
+What is already known about this failure, as unverified context to confirm, not an \
+established fact. A separate workflow (beads vl-9xlc/vl-6qrg/vl-5ik3, root vl-8yxt, not \
+part of this formula) already investigated, experimented, and shipped a fix against a \
+different image (rjrock2/vllm-ci-ext:oct14, frozen amd-aiter 0.1.24.post1, no source \
+tree present); treat its conclusions as a lead to verify independently against a \
+freshly rebuilt tip-of-tree aiter, not a given."""
+default = '''Build vllm/amd-ci #14694 (commit cd53e03f15e7e2115bf34d6ac5a768956b20a667, a
+"DO NOT MERGE" sweep that flips VLLM_ROCM_USE_AITER's default to True) failed 3 of 1088
+tests in tests/kernels/test_concat_mla_q.py::test_concat_mla_q_fp8_nope_and_rope, all
+with enabled=True (the `+mla_decode_concat_quant_fp8` custom op active), reporting
+~58.5-58.6% mismatched elements and a maximum absolute difference of exactly 16.0.
+The prior workflow's finding: with VLLM_ROCM_USE_AITER=1 on gfx942 (float8_e4m3fnuz),
+`QuantFP8.forward_hip` (vllm/model_executor/layers/quantization/input_quant_fp8.py)
+dispatches static per-tensor FP8 quantization to aiter's `static_per_tensor_quant`
+(wrapped by `rocm_aiter_ops.per_tensor_quant` in vllm/_aiter_ops.py), which saturates
+at +-240, while vLLM's own convention (`get_fp8_min_max` in quant_utils.py:99-107) and
+every reference/test clamp to +-224 on fnuz. Elements with |x/scale| > 224 therefore
+diverge by exactly scale*16 between the two paths; this reproduced identically
+regardless of whether the input was transposed, ruling out the initially-suspected
+layout/reshape theory.
+Known-candidate, unverified fix: in `QuantFP8.forward_hip`, skip the aiter per-tensor
+path (fall through to `QuantFP8.forward_cuda` / `ops.scaled_fp8_quant`, which already
+clamps to 224) when `scale is not None and current_platform.is_fp8_fnuz()`. The prior
+workflow shipped a version of this (vllm commit 5339ae89f3129e2c23749f09e068b36efb2542cd,
+not part of this formula's inputs) validated only against aiter 0.1.24.post1 (CI's
+nightly was 0.1.26+rocm7.2.3) and only on gfx942; it left the dynamic per-tensor path,
+gfx950, and whether aiter's own 240 clamp is intentional or a bug all unchecked. Do not
+assume aiter's current tip-of-tree still saturates at 240, or that the fix location is
+still correct, without re-deriving it from this workflow's own evidence.'''
+
+[vars.editable_mode_notes]
+description = """\
+How aiter distinguishes a true editable/develop install from a frozen wheel install, and \
+what the investigator/experimenter/implementer must use to overwrite and verify it."""
+default = '''aiter's setup.py decides packaging mode from argv: `is_develop_mode()`
+(setup.py) is True when invoked as `python setup.py develop` or with any arg containing
+"editable" (i.e. `pip install -e .`). `write_install_mode()` then writes a plain-text file
+`<aiter-package-dir>/install_mode` containing literally `develop` or `install`.
+For a REGULAR (non-develop) install, `prepare_packaging()` copies 3rdparty/, hsa/,
+gradlib/, csrc/ into a separate `aiter_meta/` tree next to the installed package and
+strips .gitignored asm dumps; develop mode skips this entirely (no aiter_meta copy is
+made).
+At import time, aiter/jit/core.py reads `{this_dir}/../install_mode`: if its content is
+"develop", `AITER_META_DIR` is set to `AITER_ROOT_DIR` (the source tree itself, used
+directly for JIT builds -- true editable mode); otherwise `AITER_META_DIR` is the
+separate `aiter_meta/` copy. A missing install_mode file defaults to develop-mode
+behavior.
+To genuinely put the image's aiter into editable/develop mode against a tip-of-tree
+checkout: get a tip-of-tree aiter source tree into the container (bind mount the rig
+worktree, read-write -- aiter's JIT writes build artifacts back into its own source tree
+at runtime, so a read-only mount silently breaks this), uninstall/remove the existing
+non-editable amd-aiter wheel install (package dir, aiter_meta/, and its dist-info) from
+site-packages, then run `python setup.py develop` (or `pip install -e .`, which
+additionally needs `./.github/scripts/install_triton.sh` per aiter's CONTRIBUTE.md for
+the full Python+HIP/CK kernel path) FROM the mounted worktree. Verify genuine editable
+mode by: (a) `python -c "import aiter; print(aiter.__file__)"` resolving inside the
+mounted worktree, not dist-packages; (b) the worktree's own `aiter/install_mode` file
+(not a copy) reading "develop"; (c) confirming no `aiter_meta/` tree was created/used --
+JIT builds must read source directly from the mounted worktree root.'''
+
+[vars.gpu_rules]
+description = "Rules for using the local GPUs safely."
+default = '''LOCAL GPU RULES (this host has 8 MI300X GPUs, shared with other users).
+1. Use ONE GPU per container. Before every launch run `rocm-smi --showuse` and
+   `rocm-smi --showmeminfo vram`; pick a GPU with 0% use and ~no VRAM held.
+   Never use a busy GPU. Record the index in your report. Importing aiter
+   without real GPU access (no --device mapping) fails with "RuntimeError: No
+   gfx arch found in rocminfo output" -- this is expected and not itself a bug;
+   always run with real device access for anything beyond a plain syntax check.
+2. Run containers with `--device=/dev/kfd --device=/dev/dri --group-add video
+   --security-opt seccomp=unconfined --ipc=host --shm-size=16g` and
+   `-e HIP_VISIBLE_DEVICES=<idx>`, name them with your claimed bead ID, use
+   `--entrypoint bash` (the image entrypoint is not a shell), and `docker rm -f`
+   them when done, on every error path.
+3. aiter JIT-compiles kernels on first use and can take minutes; allow for it.
+   Keep each experiment's JIT cache isolated (a per-bead cache directory) to
+   avoid cross-experiment contamination, and note whether a clean/cold JIT
+   cache changes the result, since you are rebuilding aiter from source and a
+   stale cache could mask or fake a fix.
+4. Do not modify the image. Do not run `docker commit` over `{{image}}`. The
+   editable-mode overwrite this task requires happens by bind-mounting a
+   writable tip-of-tree aiter worktree into the container and running the
+   install there, at container-run time; the underlying image is never
+   altered. Mount the aiter worktree READ-WRITE (never `:ro`): aiter's JIT
+   writes generated build artifacts back into its own source tree, and a
+   read-only mount silently breaks editable-mode JIT builds (this exact
+   failure mode -- falling back to a different, non-worktree JIT cache -- has
+   been hit before in unrelated work; do not repeat it). When validating a
+   vllm-side fix, bind-mount your vllm worktree's python sources separately
+   over /root/dev/vllm (read-only is fine there).
+5. Disk: `/`, `/tmp`, `/root` share one overlay filesystem on this host (about
+   3.5T total; check `df -h` before large builds).'''
+
+[[steps]]
+id = "body"
+title = """\
+Investigate, experiment, and fix the aiter static per-tensor FP8 fnuz clamp mismatch \
+(+-240 vs vLLM's +-224) using a freshly rebuilt tip-of-tree aiter inside \
+rjrock2/vllm-ci-ext:oct16"""
+needs = ["implement"]
+
+[steps.metadata]
+"gc.kind" = "scope"
+"gc.scope_name" = "aiter-fnuz-clamp-mismatch"
+"gc.scope_role" = "body"
+
+[[steps]]
+id = "investigate"
+title = """\
+Investigate the aiter static per-tensor FP8 fnuz clamp mismatch with aiter rebuilt \
+from tip of tree"""
+description = """
+Investigate the failure: AITER's static per-tensor FP8 quantization kernel
+(`rocm_aiter_ops.per_tensor_quant`, reached from `QuantFP8.forward_hip` in
+vllm/model_executor/layers/quantization/input_quant_fp8.py) saturates
+`float8_e4m3fnuz` values at +-240, while vLLM's own convention
+(`get_fp8_min_max` in quant_utils.py) and its MLA decode-path consumers (e.g.
+`_DecodeConcatQuantFP8` in vllm/model_executor/layers/attention/mla_attention.py)
+expect +-224. This workflow requires you to first rebuild the target image's
+installed aiter from a tip-of-tree checkout in true editable/develop mode, and
+reproduce/diagnose the bug against THAT freshly built aiter, not against the
+image's stock wheel install and not via a lighter-weight PYTHONPATH injection
+-- the point of rebuilding is to confirm the clamp mismatch still exists in
+current aiter source, not just in whatever wheel version happens to be frozen
+into the image.
+
+Context, as unverified claims to confirm (not established facts):
+
+{{known_context}}
+
+How aiter's editable/develop mode works, and how to put the image's aiter into
+it against a tip-of-tree checkout:
+
+{{editable_mode_notes}}
+
+Environment: use the local docker image `{{image}}` (already present locally;
+do not pull). Resolve the aiter rig's source repository and tip-of-tree commit
+using `gc rig list --json` (registered path hint: {{aiter_repo_path}}; do not
+assume this hint is accurate without verifying it against the rig
+registration). The vllm fix will land in the vllm rig (host checkout hint:
+{{vllm_repo_path}}, read-only here; the image already has its own
+/root/dev/vllm checkout, which is sufficient for diagnosis-only work in this
+step).
+
+{{gpu_rules}}
+
+Additional focus or hints: {{question}}
+
+Diagnose only; follow your agent's isolation rules and do not implement a fix
+in this step. Do the aiter editable-mode overwrite in your own isolated
+worktree (never the shared aiter checkout), on its own branch, per your pack's
+worktree protocol, and bind-mount that worktree read-write into the container
+to perform the `setup.py develop` (or `pip install -e .`) overwrite and all
+testing. Confirm genuine editable mode (aiter.__file__ location, install_mode
+file content, absence of a used aiter_meta/ tree) before treating any
+reproduction as valid.
+
+Reproduce the smallest failing case first: call the aiter per-tensor quant
+path directly on a tensor with values whose |x/scale| exceeds 224 and confirm
+it saturates at 240 rather than 224 against the freshly built aiter; compare
+against vllm's own fp8 quant kernel (`ops.scaled_fp8_quant`) and
+`get_fp8_min_max` on the same inputs. Then run `cd /root/dev/vllm && python3
+-m pytest -v -s tests/kernels/test_concat_mla_q.py -k
+test_concat_mla_q_fp8_nope_and_rope` with `VLLM_ROCM_USE_AITER=1` (against the
+image's own, unedited vllm checkout) to confirm the real test still fails the
+same way with the rebuilt aiter, and record whether it passes with the flag
+unset.
+
+Use `{{artifact_dir}}` as the shared directory for this run. Write your
+artifacts under `{{artifact_dir}}/investigate/`, creating that subdirectory
+if needed; it must not contain an earlier run's reports. Do not overwrite
+existing files.
+
+Before closing this step, write `{{artifact_dir}}/investigate/investigation.md` with:
+- Your claimed bead ID, the aiter tip-of-tree commit used, and date.
+- The exact reproduction commands, container name/flags, GPU index,
+  environment variables, versions; mark missing information.
+- The exact steps used to overwrite the image's aiter with the editable
+  tip-of-tree checkout (worktree path/branch, mount flags, install command run
+  inside the container, and the three editable-mode verification checks and
+  their results).
+- Fresh findings with file:line references (in the aiter worktree and the
+  image's /root/dev/vllm) and raw output paths. Separate fresh observations
+  from the supplied context and from untested hypotheses.
+- Ranked root-cause hypotheses with confidence, alternatives, and missing
+  evidence; whether the clamp mismatch still reproduces identically against
+  tip-of-tree aiter, or has changed.
+- A minimal experiment plan for the experimenter: hypothesis, prediction,
+  control, exact commands, distinguishing result.
+
+Append the handoff summary and absolute report path to this claimed step's
+notes with `gc bd update <claimed-bead-id> --append-notes <text>` and record
+`--set-metadata investigation.report_path=<path>`. Verify the report is
+readable, then set `gc.outcome=pass` on this claimed step and close only it.
+
+If blocked (image missing, no idle GPU, cannot produce a usable handoff),
+append the reason, set `gc.outcome=fail` and `gc.failure_reason=<reason>`, and
+close only this step. Do not close the workflow root.
+"""
+
+[steps.metadata]
+"gc.run_target" = "vllm/investigation.investigator"
+"gc.scope_ref" = "body"
+"gc.scope_role" = "member"
+"gc.on_fail" = "abort_scope"
+
+[[steps]]
+id = "experiment"
+title = """\
+Validate the aiter fnuz clamp mismatch investigation with minimal experiments"""
+needs = ["investigate"]
+description = """
+Read `{{artifact_dir}}/investigate/investigation.md` before running anything.
+Read the producer bead ID recorded in it, and verify it belongs to the same
+`gc.root_bead_id` as your claimed step and has `gc.outcome=pass`. Test
+environment: docker image `{{image}}`.
+
+{{gpu_rules}}
+
+Additional focus or hints: {{question}}
+
+Test the handoff's hypotheses; do not assume its conclusions are correct,
+including whether its claimed editable-mode overwrite is genuinely in effect
+-- re-verify it yourself (aiter.__file__, install_mode file content, no
+aiter_meta/ tree in use) before trusting any reproduction built on top of it.
+Follow your six-step protocol for every experiment: hypothesis, prediction
+(recorded before running), exact command/environment, run, actual result,
+verdict (supports / contradicts / inconclusive). Prefer the smallest
+experiments that separate the hypotheses, for example:
+- Confirm the exact saturation bound of aiter's static per-tensor quant kernel
+  against tip-of-tree source, for values just below, at, and above 224*scale
+  and 240*scale, and compare against vllm's own fp8 quant kernel and
+  `get_fp8_min_max` on the same inputs.
+- Reproduce `test_concat_mla_q_fp8_nope_and_rope` with `VLLM_ROCM_USE_AITER=1`
+  against the rebuilt tip-of-tree aiter, and confirm it passes with the flag
+  unset, isolating the AITER static per-tensor dispatch as the trigger (not
+  transposition or layout, per the investigation).
+- Check the dynamic per-tensor quant path (`dynamic_per_tensor_quant`) for the
+  same saturation mismatch, since this was left untested previously.
+- Test candidate fix shapes without committing to one, e.g. (1) skip the
+  aiter per-tensor path in `QuantFP8.forward_hip` for static scales when
+  `current_platform.is_fp8_fnuz()`, falling through to
+  `QuantFP8.forward_cuda`; (2) clamp the aiter wrapper's output to
+  `get_fp8_min_max()` bounds after the kernel call; (3) any other direction
+  the evidence supports. Run the real failing test with each candidate
+  applied by bind-mounting edited .py files into the container (see GPU
+  rules), and run a broader slice of fp8 quant tests (e.g.
+  test_fp8_quant_group.py, test_rocm_fp8.py, test_fp8_quant.py) with AITER=1
+  to check for regressions.
+
+Save experiment records and raw output under `{{artifact_dir}}/experiment/`
+(creating it if needed) and write `{{artifact_dir}}/experiment/experiments.md`
+with the producer bead ID, every experiment's six steps, evidence paths,
+verdicts, uncertainties, and a recommended fix direction naming the source
+component, the function(s) to change, and the tested revision. Do not
+implement the production fix in the shared vllm or aiter checkouts; candidate
+edits belong only in your own experiment worktree(s).
+
+Append the summary and absolute artifact paths to this claimed step's notes
+with `gc bd update <claimed-bead-id> --append-notes <text>`, set
+`experiment.report_path=<path>` and `gc.outcome=pass`, and close only this
+step. `pass` means the experiments were completed, even if a hypothesis is
+contradicted or inconclusive.
+
+If the handoff is missing, stale, or unusable, or runtime resources prevent
+execution, record the blocker, set `gc.outcome=fail` and
+`gc.failure_reason=<reason>`, and close only this step. Do not fabricate
+results or close earlier steps or the workflow root.
+"""
+
+[steps.metadata]
+"gc.run_target" = "vllm/experimentation.experimenter"
+"gc.scope_ref" = "body"
+"gc.scope_role" = "member"
+"gc.on_fail" = "abort_scope"
+
+[[steps]]
+id = "implement"
+title = """\
+Implement, validate, and commit the vllm-side fix for the aiter fnuz clamp mismatch"""
+needs = ["experiment"]
+description = """
+Read `{{artifact_dir}}/experiment/experiments.md`, the producer experiment
+bead, and the investigation artifacts it cites. Verify the investigation and
+experiment step beads belong to your `gc.root_bead_id`, completed with
+`gc.outcome=pass`, and recorded the report paths you are reading; record
+their IDs and paths on your claimed step.
+
+Additional scope and resource constraints: {{constraints}}
+
+{{gpu_rules}}
+
+Choose the smallest coherent root-cause fix supported by the experiments, and
+explain why it preserves existing behavior for the contiguous fast path,
+other group shapes (per-token, per-group), dynamic per-tensor scales,
+non-fnuz dtypes (gfx950 e4m3fn), and non-ROCm platforms. The owning
+repository is expected to be vllm (host checkout hint {{vllm_repo_path}};
+resolve the authoritative path via `gc rig list --json`); verify against the
+evidence rather than assuming it. If the experiments show the right fix
+belongs in aiter itself, do not edit the installed aiter or the aiter rig;
+implement the vllm-side guard/fallback and document the aiter limitation
+instead. Optional base-ref override: {{base_ref}}. If empty, use the vllm
+rig's tip-of-tree default branch.
+
+Follow your worktree protocol. Record the shared vllm checkout's dirty
+state, branch/HEAD, and protected main/default-branch refs. Create/recover
+the linked worktree `$GC_CITY/worktrees/vllm/<claimed-bead-id>` on branch
+`implement/<claimed-bead-id>`, verifying repository, path, ownership, and
+branch before any edit. Save its absolute path as `work_dir` and
+`implementation.worktree_path`, and record `implementation.branch` and
+`implementation.base_commit`. All edits, builds, tests, staging, and commits
+happen there. Never modify the shared vllm checkout, never advance main,
+never edit the docker image.
+
+Implement the fix with focused regression coverage. Validate inside
+`{{image}}` with aiter rebuilt from aiter rig tip-of-tree in true
+editable/develop mode (per the editable-mode notes used in earlier steps),
+bind-mounting your vllm worktree's python sources over /root/dev/vllm and
+confirming `vllm.__file__` points at them:
+1. The original failure on the baseline (fresh reproduction against the
+   rebuilt tip-of-tree aiter before your fix is applied in the worktree).
+2. All 3 previously-failing parametrizations of
+   `test_concat_mla_q_fp8_nope_and_rope` passing after your fix, with
+   `VLLM_ROCM_USE_AITER=1`.
+3. The rest of `tests/kernels/test_concat_mla_q.py`, plus any other tests
+   exercising `QuantFP8`'s static per-tensor path (e.g.
+   test_fp8_quant_group.py, test_rocm_fp8.py, test_fp8_quant.py), with
+   `VLLM_ROCM_USE_AITER=1`, for regressions, plus the repository's required
+   lint/pre-commit hooks on changed files.
+As a secondary check, note (do not block on) whether the image's own stock
+aiter wheel (without the tip-of-tree rebuild) shows the same clamp behavior,
+so the fix's applicability isn't an artifact of only the rebuilt
+environment. Report which results are proxy-only (limited GPU archs, an
+aiter version that may differ from CI's exact nightly, no end-to-end
+served-model MLA decode run, no accuracy or perf evaluation) and what
+remains untested.
+
+After validation passes, recheck the worktree and branch, stage only
+intended files by explicit path, inspect the staged diff, run `git diff
+--cached --check`, and commit on `implement/<claimed-bead-id>` following the
+repo's commit/DCO/hook rules. Never bypass failing hooks. Record the full
+hash as `implementation.commit_hash`. Do not merge, push, or open a PR.
+
+Use `{{artifact_dir}}/implement/` for this run's artifacts (creating it if
+needed). Write `{{artifact_dir}}/implement/implementation.md`
+(source/producer IDs, fix and rationale, repository, worktree/branch/base/fix
+commits, the aiter tip-of-tree rebuild and editable-mode verification used
+for validation, validation commands and results, limitations, artifact
+paths) and export `{{artifact_dir}}/implement/implementation.patch` with
+`git diff --binary <base-commit> <fix-commit>`. Append the summary and
+paths to your claimed bead, set `implementation.report_path`,
+`implementation.patch_path`, `implementation.commit_hash`, and
+`gc.outcome=pass`, then close only your step.
+
+If no justified fix exists, required validation is unavailable, or
+committing fails, write a partial report with blockers, preserve worktree
+progress, set `gc.outcome=fail` and `gc.failure_reason`, and close only your
+step. Do not close earlier steps or the workflow root.
+"""
+
+[steps.metadata]
+"gc.run_target" = "vllm/implementation.implementer"
+"gc.scope_ref" = "body"
+"gc.scope_role" = "member"
+"gc.on_fail" = "abort_scope"
