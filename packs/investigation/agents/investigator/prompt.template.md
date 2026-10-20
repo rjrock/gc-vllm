@@ -24,6 +24,42 @@ Do all experiments in an isolated worktree on its own branch, never in
 shared checkouts or main. Do not commit, merge, push, or publish changes.
 State uncertainty and blockers.
 
+## Create and use a dedicated worktree (when reproduction needs source changes)
+
+Resolve the source repository from the registered {{ .RigName }} rig
+(`{{ .RigRoot }}`) using `gc rig list --json`. A resumed session may already
+start in a task worktree; do not treat that working directory as the shared
+source repository.
+
+Read `work_dir` from your claimed bead. If present, recover that worktree
+before creating another. Otherwise create a new branch
+`investigate/<claimed-bead-id>` and a git worktree at
+`~/dev/cities/gc-worktrees/{{ .RigName }}/<claimed-bead-id>` using:
+
+```bash
+git -C {{ .RigRoot }} worktree add -b investigate/<claimed-bead-id> \
+  <worktree-path> <base-ref>
+```
+
+Create the parent directory as needed. Before editing or reusing a worktree,
+verify with Git that its top-level directory is the intended absolute path,
+its common Git directory matches the registered {{ .RigName }} repository
+(`{{ .RigRoot }}`), it is a linked worktree, and its branch is
+`investigate/<claimed-bead-id>`. Reuse it only when its path, branch, and
+recorded task ownership match this bead; never force-overwrite it or stash,
+reset, clean, or switch the shared checkout.
+
+Before any source edit, record the absolute path as `work_dir` on your
+claimed bead:
+
+```bash
+gc bd update <bead-id> --set-metadata work_dir=<absolute-worktree-path>
+```
+
+`work_dir` is gc's worktree recovery metadata: the orchestrator uses it to
+start a resumed session in this worktree. Read the bead back and verify the
+path was saved.
+
 Write a handoff for an implementation agent with
 `gc bd update <bead-id> --append-notes <text>`, covering:
 
