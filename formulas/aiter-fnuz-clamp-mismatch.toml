@@ -10,7 +10,12 @@ VLLM_ROCM_USE_AITER(_LINEAR)=1) saturates at +-240, while vLLM's own \
 abs diff 16.0) whenever |x/scale| exceeds 224. This workflow requires rebuilding the \
 target image's installed aiter from a tip-of-tree checkout in true editable/develop \
 mode before diagnosing, experimenting, or validating, so the aiter kernel under test \
-is current source, not a frozen wheel."""
+is current source, not a frozen wheel. A parallel lane runs the same \
+investigate/experiment/implement sequence against real MI350 (gfx950) hardware over \
+SSH, to discover whether an analogous mismatch exists there too -- gfx950 typically \
+uses the standard float8_e4m3fn convention rather than _fnuz, so the ±240 vs ±224 \
+bound may not transfer verbatim; that lane must establish the actual dtype/dispatch \
+path on gfx950 before concluding whether a comparable bug is present or absent."""
 
 [requires]
 formula_compiler = ">=2.0.0"
@@ -158,13 +163,60 @@ default = '''LOCAL GPU RULES (this host has 8 MI300X GPUs, shared with other use
 5. Disk: `/`, `/tmp`, `/root` share one overlay filesystem on this host (about
    3.5T total; check `df -h` before large builds).'''
 
+[vars.remote_host]
+description = """\
+SSH alias/hostname for the MI350 machine used by the *_mi350 steps. Already registered \
+in this operator's ~/.ssh/config; not a rig and not resolvable via `gc rig list`."""
+default = "m11"
+pattern = "^\\S+$"
+
+[vars.remote_gpu_rules]
+description = """\
+Rules for using the remote MI350 host's GPUs safely over SSH, and for getting the \
+image and a writable aiter worktree onto that host without altering the local rig \
+checkout or the docker image."""
+default = '''REMOTE MI350 RULES ({{remote_host}}, resolved via SSH alias to
+smci355-ccs-aus-m11-05.cs-aus.dcgpu -- 8 MI355X GPUs, gfx950, ROCm 7.2.1, shared with
+other users, reachable only with a valid SSH key and an active Conductor reservation).
+0. Verify reachability first with `ssh {{remote_host}} true`. If this fails, the
+   blocker is almost certainly a missing SSH key or Conductor reservation, not
+   anything this workflow can fix from inside a container -- record it as a blocker
+   and stop; do not retry indefinitely or attempt to acquire a reservation yourself.
+1. Image transfer: `{{image}}` is local-only to the dispatching host and is not in
+   any registry. Before using it, check whether it is already present with `ssh
+   {{remote_host}} docker image inspect {{image}}`; only if absent, transfer it once
+   with `docker save {{image}} | ssh {{remote_host}} docker load` (do not re-transfer
+   per experiment) and confirm the loaded image ID matches the local one. Never
+   `docker push`/pull this image through a registry.
+2. Worktree placement: the editable-mode aiter (and, for implement_mi350, the vllm
+   fix) worktrees live on the dispatching host's filesystem, not on
+   {{remote_host}}. Before each remote run, `rsync -a --delete` the relevant
+   worktree to a scratch directory under your own home on {{remote_host}} (name it
+   with your claimed bead ID), then bind-mount THAT remote copy read-write into the
+   remote container -- a cross-host bind mount is not possible. Treat the local
+   worktree as the only source of truth: make edits locally, then re-rsync before
+   re-validating; never edit the remote copy directly.
+3. All docker commands run via `ssh {{remote_host}} docker ...` (or an interactive
+   `ssh {{remote_host}}` session) rather than locally. Apply the same one-GPU-per-
+   container discipline as the local GPU rules: run `ssh {{remote_host}} rocm-smi
+   --showuse` and `--showmeminfo vram` first, pick an idle GPU, record its index,
+   use `--device=/dev/kfd --device=/dev/dri --group-add video --security-opt
+   seccomp=unconfined --ipc=host --shm-size=16g -e HIP_VISIBLE_DEVICES=<idx>`, name
+   containers with your claimed bead ID, use `--entrypoint bash`, and `ssh
+   {{remote_host}} docker rm -f <name>` on every error path.
+4. Do not modify the image or run `docker commit` on {{remote_host}} either.
+5. Disk: {{remote_host}} has roughly 53G free on a shared 3.5T filesystem at last
+   check (nearly full) -- run `ssh {{remote_host}} df -h /` before loading the
+   image or building, and remove only this task's own image copy/containers/
+   worktree scratch dir when done, never a broad prune affecting other users.'''
+
 [[steps]]
 id = "body"
 title = """\
 Investigate, experiment, and fix the aiter static per-tensor FP8 fnuz clamp mismatch \
 (+-240 vs vLLM's +-224) using a freshly rebuilt tip-of-tree aiter inside \
-rjrock2/vllm-ci-ext:oct16"""
-needs = ["implement"]
+rjrock2/vllm-ci-ext:oct16, on both gfx942 and MI350/gfx950 hardware"""
+needs = ["implement", "implement_mi350"]
 
 [steps.metadata]
 "gc.kind" = "scope"
@@ -423,6 +475,292 @@ If no justified fix exists, required validation is unavailable, or
 committing fails, write a partial report with blockers, preserve worktree
 progress, set `gc.outcome=fail` and `gc.failure_reason`, and close only your
 step. Do not close earlier steps or the workflow root.
+"""
+
+[steps.metadata]
+"gc.run_target" = "vllm/implementation.implementer"
+"gc.scope_ref" = "body"
+"gc.scope_role" = "member"
+"gc.on_fail" = "abort_scope"
+
+[[steps]]
+id = "investigate_mi350"
+title = """\
+Investigate whether the aiter FP8 clamp mismatch has an analogue on MI350 \
+(gfx950) hardware"""
+description = """
+Investigate, on real MI350 (gfx950) hardware over SSH, whether the gfx942
+fnuz clamp mismatch described below has an analogue here. Do not assume it
+does: gfx950 typically uses the standard OCP `float8_e4m3fn` convention
+rather than `float8_e4m3fnuz`, so `current_platform.is_fp8_fnuz()` may be
+False on this arch, `QuantFP8.forward_hip`'s dispatch may take a different
+branch than on gfx942, and even `get_fp8_min_max`'s own ±224/±240-style
+bounds may differ for the non-uz dtype. Establish the actual dtype,
+dispatch path, and expected/actual clamp bounds on this hardware FIRST, as
+fresh evidence; only then judge whether a comparable mismatch is present,
+absent, or differently shaped. This workflow requires rebuilding the
+target image's installed aiter from a tip-of-tree checkout in true
+editable/develop mode on the remote host before diagnosing, exactly as the
+gfx942 lane does, so the aiter kernel under test is current source, not a
+frozen wheel.
+
+The gfx942 finding this lane is checking for an analogue of, as unverified
+context (not an established fact on this hardware):
+
+{{known_context}}
+
+How aiter's editable/develop mode works, and how to put the image's aiter
+into it against a tip-of-tree checkout (applies identically on the remote
+host once the worktree and image are transferred there):
+
+{{editable_mode_notes}}
+
+Environment: use the local docker image `{{image}}`, transferred to the
+remote host per the rules below (do not pull or rebuild it there).
+Resolve the aiter rig's source repository and tip-of-tree commit using `gc
+rig list --json` (registered path hint: {{aiter_repo_path}}; verify rather
+than assume) on THIS (dispatching) host -- the rig itself lives here, not
+on the remote host. The vllm fix will land in the vllm rig (host checkout
+hint: {{vllm_repo_path}}, read-only here).
+
+{{remote_gpu_rules}}
+
+Additional focus or hints: {{question}}
+
+Diagnose only; do not implement a fix in this step. Do the aiter
+editable-mode overwrite in your own isolated worktree on this (dispatching)
+host, on its own branch, per your pack's worktree protocol, then rsync it
+to the remote host and bind-mount the remote copy read-write into the
+remote container to perform the `setup.py develop` (or `pip install -e .`)
+overwrite and all testing. Confirm genuine editable mode (aiter.__file__
+location, install_mode file content, absence of a used aiter_meta/ tree)
+before treating any reproduction as valid.
+
+Reproduce the smallest failing case first: on the remote host, call the
+aiter per-tensor quant path directly on a tensor of this hardware's actual
+fp8 dtype with values whose magnitude approaches and exceeds whatever
+bound `get_fp8_min_max` reports for that dtype on gfx950, and compare
+against vllm's own fp8 quant kernel (`ops.scaled_fp8_quant`) on the same
+inputs. Then run `cd /root/dev/vllm && python3 -m pytest -v -s
+tests/kernels/test_concat_mla_q.py -k test_concat_mla_q_fp8_nope_and_rope`
+with `VLLM_ROCM_USE_AITER=1` on the remote host (against the image's own,
+unedited vllm checkout) and record whether it fails, passes, or is
+skipped/inapplicable on this hardware, and why.
+
+Use `{{artifact_dir}}` as the shared directory for this run. Write your
+artifacts under `{{artifact_dir}}/investigate_mi350/`, creating that
+subdirectory if needed; it must not contain an earlier run's reports. Do
+not overwrite existing files.
+
+Before closing this step, write
+`{{artifact_dir}}/investigate_mi350/investigation.md` with:
+- Your claimed bead ID, the aiter tip-of-tree commit used, the remote host
+  used, and date.
+- The exact reproduction commands, container name/flags, remote GPU index,
+  environment variables, versions; mark missing information.
+- The exact steps used to transfer the image and overwrite the remote
+  aiter with the editable tip-of-tree checkout (local worktree path/branch,
+  remote scratch path, rsync command, mount flags, install command run
+  inside the remote container, and the three editable-mode verification
+  checks and their results).
+- What this hardware's actual fp8 dtype and dispatch path are, established
+  as fresh evidence, with file:line references (in the aiter worktree and
+  the image's /root/dev/vllm) and raw output paths.
+- Whether an analogous clamp/saturation mismatch is present, absent, or
+  differently shaped on this hardware, with confidence, alternatives, and
+  missing evidence. Separate fresh observations from the supplied gfx942
+  context and from untested hypotheses.
+- A minimal experiment plan for the experimenter: hypothesis, prediction,
+  control, exact commands, distinguishing result. If the investigation
+  concludes there is no bug here, say so explicitly and state what a
+  confirming experiment would look like regardless.
+
+Append the handoff summary and absolute report path to this claimed step's
+notes with `gc bd update <claimed-bead-id> --append-notes <text>` and
+record `--set-metadata investigation.report_path=<path>`. Verify the
+report is readable, then set `gc.outcome=pass` on this claimed step and
+close only it.
+
+If blocked (remote host unreachable, image transfer fails, no idle remote
+GPU, cannot produce a usable handoff), append the reason, set
+`gc.outcome=fail` and `gc.failure_reason=<reason>`, and close only this
+step. Do not close the workflow root.
+"""
+
+[steps.metadata]
+"gc.run_target" = "vllm/investigation.investigator"
+"gc.scope_ref" = "body"
+"gc.scope_role" = "member"
+"gc.on_fail" = "abort_scope"
+
+[[steps]]
+id = "experiment_mi350"
+title = """\
+Validate the MI350 clamp-mismatch investigation with minimal experiments"""
+needs = ["investigate_mi350"]
+description = """
+Read `{{artifact_dir}}/investigate_mi350/investigation.md` before running
+anything. Read the producer bead ID recorded in it, and verify it belongs
+to the same `gc.root_bead_id` as your claimed step and has
+`gc.outcome=pass`. Test environment: docker image `{{image}}`, on the
+remote host.
+
+{{remote_gpu_rules}}
+
+Additional focus or hints: {{question}}
+
+Test the handoff's hypotheses; do not assume its conclusions are correct,
+including its claim about which fp8 dtype/dispatch path this hardware
+actually uses, and whether its claimed editable-mode overwrite is
+genuinely in effect -- re-verify it yourself (aiter.__file__, install_mode
+file content, no aiter_meta/ tree in use) before trusting any
+reproduction built on top of it. Follow your six-step protocol for every
+experiment: hypothesis, prediction (recorded before running), exact
+command/environment, run, actual result, verdict (supports / contradicts /
+inconclusive). Prefer the smallest experiments that separate the
+hypotheses, for example:
+- Confirm the actual fp8 dtype and clamp bound this hardware's
+  `QuantFP8.forward_hip` dispatches to, and the exact saturation bound of
+  aiter's static per-tensor quant kernel on this hardware against
+  tip-of-tree source, for values just below, at, and above whatever bound
+  `get_fp8_min_max` reports for that dtype -- do not assume the gfx942
+  ±224/±240 values apply unmodified.
+- If an analogous mismatch is found, reproduce
+  `test_concat_mla_q_fp8_nope_and_rope` with `VLLM_ROCM_USE_AITER=1` on
+  this hardware against the rebuilt tip-of-tree aiter to confirm it fails
+  the same way; if the investigation found no mismatch, confirm the test
+  passes (or is inapplicable) instead, and say which.
+- If a mismatch is found, test the same candidate fix shapes the gfx942
+  lane considers (skip the aiter per-tensor path in `QuantFP8.forward_hip`
+  for the dtype/condition this hardware actually uses; clamp the aiter
+  wrapper's output to `get_fp8_min_max()` bounds after the kernel call; or
+  another direction the evidence supports), run the real failing test with
+  each candidate applied, and run a broader slice of fp8 quant tests
+  (e.g. test_fp8_quant_group.py, test_rocm_fp8.py, test_fp8_quant.py) with
+  AITER=1 to check for regressions on this hardware.
+
+Save experiment records and raw output under
+`{{artifact_dir}}/experiment_mi350/` (creating it if needed) and write
+`{{artifact_dir}}/experiment_mi350/experiments.md` with the producer bead
+ID, every experiment's six steps, evidence paths, verdicts, uncertainties,
+and a recommended direction -- which may legitimately be "no fix needed;
+this hardware's dtype/dispatch path does not reproduce the mismatch" if
+that is what the evidence shows. Do not implement the production fix in
+the shared vllm or aiter checkouts; candidate edits belong only in your
+own experiment worktree(s).
+
+Append the summary and absolute artifact paths to this claimed step's
+notes with `gc bd update <claimed-bead-id> --append-notes <text>`, set
+`experiment.report_path=<path>` and `gc.outcome=pass`, and close only this
+step. `pass` means the experiments were completed, even if a hypothesis is
+contradicted, inconclusive, or the conclusion is "no bug here".
+
+If the handoff is missing, stale, or unusable, or runtime resources
+prevent execution, record the blocker, set `gc.outcome=fail` and
+`gc.failure_reason=<reason>`, and close only this step. Do not fabricate
+results or close earlier steps or the workflow root.
+"""
+
+[steps.metadata]
+"gc.run_target" = "vllm/experimentation.experimenter"
+"gc.scope_ref" = "body"
+"gc.scope_role" = "member"
+"gc.on_fail" = "abort_scope"
+
+[[steps]]
+id = "implement_mi350"
+title = """\
+Implement, validate, and commit an MI350-side fix if the experiments \
+justify one"""
+needs = ["experiment_mi350"]
+description = """
+Read `{{artifact_dir}}/experiment_mi350/experiments.md`, the producer
+experiment bead, and the investigation artifacts it cites. Verify the
+investigation and experiment step beads belong to your `gc.root_bead_id`,
+completed with `gc.outcome=pass`, and recorded the report paths you are
+reading; record their IDs and paths on your claimed step.
+
+If the experiments concluded no analogous mismatch exists on this
+hardware, do not invent a fix: write the report documenting that
+conclusion and the evidence for it, set `gc.outcome=pass` (a confirmed
+absence is a valid, completed result, not a failure), and close only your
+step -- do not proceed with the remaining implementation instructions
+below.
+
+If the experiments did find a justified fix, additional scope and
+resource constraints: {{constraints}}
+
+{{remote_gpu_rules}}
+
+Choose the smallest coherent root-cause fix supported by the experiments,
+and explain why it preserves existing behavior for the contiguous fast
+path, other group shapes (per-token, per-group), dynamic per-tensor
+scales, the gfx942 fnuz path already fixed by `implement`, and non-ROCm
+platforms. The owning repository is expected to be vllm (host checkout
+hint {{vllm_repo_path}}; resolve the authoritative path via `gc rig list
+--json`); verify against the evidence rather than assuming it. If the
+experiments show the right fix belongs in aiter itself, do not edit the
+installed aiter or the aiter rig; implement the vllm-side guard/fallback
+and document the aiter limitation instead. Optional base-ref override:
+{{base_ref}}. If empty, use the vllm rig's tip-of-tree default branch.
+
+Follow your worktree protocol, on this (dispatching) host. Record the
+shared vllm checkout's dirty state, branch/HEAD, and protected
+main/default-branch refs. Create/recover the linked worktree
+`$GC_CITY/worktrees/vllm/<claimed-bead-id>` on branch
+`implement/<claimed-bead-id>`, verifying repository, path, ownership, and
+branch before any edit. Save its absolute path as `work_dir` and
+`implementation.worktree_path`, and record `implementation.branch` and
+`implementation.base_commit`. All edits happen in this local worktree;
+rsync it to the remote host (per {{remote_gpu_rules}}) for each round of
+remote validation, and re-rsync after every local edit. Never modify the
+shared vllm checkout, never advance main, never edit the docker image on
+either host.
+
+Implement the fix with focused regression coverage. Validate on the
+remote host with aiter rebuilt from aiter rig tip-of-tree in true
+editable/develop mode (per the editable-mode notes used in earlier
+steps), bind-mounting your (rsynced) vllm worktree's python sources over
+/root/dev/vllm and confirming `vllm.__file__` points at them:
+1. The original failure on this hardware's baseline (fresh reproduction
+   against the rebuilt tip-of-tree aiter before your fix is applied in
+   the worktree).
+2. The previously-failing case now passing after your fix, with
+   `VLLM_ROCM_USE_AITER=1`, on the remote host.
+3. The rest of `tests/kernels/test_concat_mla_q.py`, plus any other tests
+   exercising `QuantFP8`'s static per-tensor path, with
+   `VLLM_ROCM_USE_AITER=1`, for regressions on this hardware, plus a
+   re-run of the gfx942 lane's own regression suite if your change could
+   plausibly affect it, plus the repository's required lint/pre-commit
+   hooks on changed files.
+Report which results are proxy-only (limited GPU archs, an aiter version
+that may differ from CI's exact nightly, no end-to-end served-model MLA
+decode run, no accuracy or perf evaluation) and what remains untested.
+
+After validation passes, recheck the worktree and branch, stage only
+intended files by explicit path, inspect the staged diff, run `git diff
+--cached --check`, and commit on `implement/<claimed-bead-id>` following
+the repo's commit/DCO/hook rules. Never bypass failing hooks. Record the
+full hash as `implementation.commit_hash`. Do not merge, push, or open a
+PR.
+
+Use `{{artifact_dir}}/implement_mi350/` for this run's artifacts (creating
+it if needed). Write `{{artifact_dir}}/implement_mi350/implementation.md`
+(source/producer IDs, fix and rationale or the documented no-bug
+conclusion, repository, worktree/branch/base/fix commits, the remote
+aiter tip-of-tree rebuild and editable-mode verification used for
+validation, validation commands and results, limitations, artifact paths)
+and, if a fix was implemented, export
+`{{artifact_dir}}/implement_mi350/implementation.patch` with `git diff
+--binary <base-commit> <fix-commit>`. Append the summary and paths to
+your claimed bead, set `implementation.report_path`,
+`implementation.patch_path` (if applicable), `implementation.commit_hash`
+(if applicable), and `gc.outcome=pass`, then close only your step.
+
+If required validation is unavailable or committing fails, write a
+partial report with blockers, preserve worktree progress, set
+`gc.outcome=fail` and `gc.failure_reason`, and close only your step. Do
+not close earlier steps or the workflow root.
 """
 
 [steps.metadata]
