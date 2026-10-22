@@ -25,6 +25,13 @@ description = "Absolute, shared artifact directory, unique to this workflow run.
 required = true
 pattern = "^/"
 
+[vars.formula_id]
+description = """\
+Run identifier used to label this run's worktree directories and branches \
+(<rig>/{{formula_id}}/<step>/<bead-id>). Defaults to this formula's name."""
+default = "aiter-fnuz-clamp-mismatch"
+pattern = "^[A-Za-z0-9_.-]+$"
+
 [vars.image]
 description = """\
 Local docker image to reproduce and validate in. Already present locally (no pull \
@@ -267,7 +274,9 @@ Additional focus or hints: {{question}}
 
 Diagnose only; follow your agent's isolation rules and do not implement a fix
 in this step. Do the aiter editable-mode overwrite in your own isolated
-worktree (never the shared aiter checkout), on its own branch, per your pack's
+worktree (never the shared aiter checkout) at
+`~/dev/cities/gc-worktrees/aiter/{{formula_id}}/investigate/<claimed-bead-id>`
+on branch `{{formula_id}}/investigate/<claimed-bead-id>`, per your pack's
 worktree protocol, and bind-mount that worktree read-write into the container
 to perform the `setup.py develop` (or `pip install -e .`) overwrite and all
 testing. Confirm genuine editable mode (aiter.__file__ location, install_mode
@@ -337,6 +346,11 @@ environment: docker image `{{image}}`.
 {{gpu_rules}}
 
 Additional focus or hints: {{question}}
+
+Use a worktree at
+`~/dev/cities/gc-worktrees/aiter/{{formula_id}}/experiment/<claimed-bead-id>`
+on branch `{{formula_id}}/experiment/<claimed-bead-id>`, per your pack's
+worktree protocol.
 
 Test the handoff's hypotheses; do not assume its conclusions are correct,
 including whether its claimed editable-mode overwrite is genuinely in effect
@@ -423,9 +437,10 @@ rig's tip-of-tree default branch.
 
 Follow your worktree protocol. Record the shared vllm checkout's dirty
 state, branch/HEAD, and protected main/default-branch refs. Create/recover
-the linked worktree `$GC_CITY/worktrees/vllm/<claimed-bead-id>` on branch
-`implement/<claimed-bead-id>`, verifying repository, path, ownership, and
-branch before any edit. Save its absolute path as `work_dir` and
+the linked worktree
+`~/dev/cities/gc-worktrees/vllm/{{formula_id}}/implement/<claimed-bead-id>`
+on branch `{{formula_id}}/implement/<claimed-bead-id>`, verifying repository,
+path, ownership, and branch before any edit. Save its absolute path as `work_dir` and
 `implementation.worktree_path`, and record `implementation.branch` and
 `implementation.base_commit`. All edits, builds, tests, staging, and commits
 happen there. Never modify the shared vllm checkout, never advance main,
@@ -456,9 +471,9 @@ remains untested.
 
 After validation passes, recheck the worktree and branch, stage only
 intended files by explicit path, inspect the staged diff, run `git diff
---cached --check`, and commit on `implement/<claimed-bead-id>` following the
-repo's commit/DCO/hook rules. Never bypass failing hooks. Record the full
-hash as `implementation.commit_hash`. Do not merge, push, or open a PR.
+--cached --check`, and commit on `{{formula_id}}/implement/<claimed-bead-id>`
+following the repo's commit/DCO/hook rules. Never bypass failing hooks. Record
+the full hash as `implementation.commit_hash`. Do not merge, push, or open a PR.
 
 Use `{{artifact_dir}}/implement/` for this run's artifacts (creating it if
 needed). Write `{{artifact_dir}}/implement/implementation.md`
@@ -529,8 +544,10 @@ Additional focus or hints: {{question}}
 
 Diagnose only; do not implement a fix in this step. Do the aiter
 editable-mode overwrite in your own isolated worktree on this (dispatching)
-host, on its own branch, per your pack's worktree protocol, then rsync it
-to the remote host and bind-mount the remote copy read-write into the
+host, at
+`~/dev/cities/gc-worktrees/aiter/{{formula_id}}/investigate_mi350/<claimed-bead-id>`
+on branch `{{formula_id}}/investigate_mi350/<claimed-bead-id>`, per your pack's
+worktree protocol, then rsync it to the remote host and bind-mount the remote copy read-write into the
 remote container to perform the `setup.py develop` (or `pip install -e .`)
 overwrite and all testing. Confirm genuine editable mode (aiter.__file__
 location, install_mode file content, absence of a used aiter_meta/ tree)
@@ -608,6 +625,11 @@ remote host.
 {{remote_gpu_rules}}
 
 Additional focus or hints: {{question}}
+
+Use a worktree at
+`~/dev/cities/gc-worktrees/aiter/{{formula_id}}/experiment_mi350/<claimed-bead-id>`
+on branch `{{formula_id}}/experiment_mi350/<claimed-bead-id>`, per your pack's
+worktree protocol.
 
 Test the handoff's hypotheses; do not assume its conclusions are correct,
 including its claim about which fp8 dtype/dispatch path this hardware
@@ -707,9 +729,9 @@ and document the aiter limitation instead. Optional base-ref override:
 Follow your worktree protocol, on this (dispatching) host. Record the
 shared vllm checkout's dirty state, branch/HEAD, and protected
 main/default-branch refs. Create/recover the linked worktree
-`$GC_CITY/worktrees/vllm/<claimed-bead-id>` on branch
-`implement/<claimed-bead-id>`, verifying repository, path, ownership, and
-branch before any edit. Save its absolute path as `work_dir` and
+`~/dev/cities/gc-worktrees/vllm/{{formula_id}}/implement_mi350/<claimed-bead-id>`
+on branch `{{formula_id}}/implement_mi350/<claimed-bead-id>`, verifying
+repository, path, ownership, and branch before any edit. Save its absolute path as `work_dir` and
 `implementation.worktree_path`, and record `implementation.branch` and
 `implementation.base_commit`. All edits happen in this local worktree;
 rsync it to the remote host (per {{remote_gpu_rules}}) for each round of
@@ -739,7 +761,8 @@ decode run, no accuracy or perf evaluation) and what remains untested.
 
 After validation passes, recheck the worktree and branch, stage only
 intended files by explicit path, inspect the staged diff, run `git diff
---cached --check`, and commit on `implement/<claimed-bead-id>` following
+--cached --check`, and commit on
+`{{formula_id}}/implement_mi350/<claimed-bead-id>` following
 the repo's commit/DCO/hook rules. Never bypass failing hooks. Record the
 full hash as `implementation.commit_hash`. Do not merge, push, or open a
 PR.

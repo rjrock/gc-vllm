@@ -192,8 +192,10 @@ Additional focus or hints: {{question}}
 
 Diagnose only; follow your agent's isolation rules and do not implement a fix
 in this step. Do the editable-mode overwrite in your own isolated worktree
-(never the shared aiter checkout), on its own branch, per your pack's worktree
-protocol, and bind-mount that worktree read-write into the container to
+(never the shared aiter checkout) at
+`~/dev/cities/gc-worktrees/aiter/{{formula_id}}/investigate/<claimed-bead-id>`
+on branch `{{formula_id}}/investigate/<claimed-bead-id>`, per your pack's
+worktree protocol, and bind-mount that worktree read-write into the container to
 perform the `setup.py develop` (or `pip install -e .`) overwrite and all
 testing. Confirm genuine editable mode (aiter.__file__ location, install_mode
 file content, absence of a used aiter_meta/ tree) before treating any
@@ -256,6 +258,11 @@ environment: docker image `{{image}}`.
 {{gpu_rules}}
 
 Additional focus or hints: {{question}}
+
+If this experiment needs source changes, use a worktree at
+`~/dev/cities/gc-worktrees/aiter/{{formula_id}}/experiment/<claimed-bead-id>`
+on branch `{{formula_id}}/experiment/<claimed-bead-id>`, per your pack's
+worktree protocol.
 
 Test the handoff's hypotheses; do not assume its conclusions are correct,
 including whether its claimed editable-mode overwrite is genuinely in effect
@@ -338,8 +345,9 @@ empty, use the aiter rig's tip-of-tree default branch.
 
 Follow your worktree protocol. Record the shared aiter checkout's dirty state,
 branch/HEAD, and protected main/default-branch refs. Create/recover the linked
-worktree `$GC_CITY/worktrees/aiter/<claimed-bead-id>` on branch
-`implement/<claimed-bead-id>`, verifying repository, path, ownership, and
+worktree
+`~/dev/cities/gc-worktrees/aiter/{{formula_id}}/implement/<claimed-bead-id>`
+on branch `{{formula_id}}/implement/<claimed-bead-id>`, verifying repository, path, ownership, and
 branch before any edit. Save its absolute path as `work_dir` and
 `implementation.worktree_path`, and record `implementation.branch` and
 `implementation.base_commit`. All edits, builds, tests, staging, and commits
@@ -365,8 +373,8 @@ new regression test, no broader suite run) and what remains untested.
 
 After validation passes, recheck the worktree and branch, stage only intended
 files by explicit path, inspect the staged diff, run `git diff --cached
---check`, and commit on `implement/<claimed-bead-id>` following the repo's
-commit/DCO/hook rules. Never bypass failing hooks. Record the full hash as
+--check`, and commit on `{{formula_id}}/implement/<claimed-bead-id>` following
+the repo's commit/DCO/hook rules. Never bypass failing hooks. Record the full hash as
 `implementation.commit_hash`. Do not merge, push, or open a PR.
 
 Use `{{artifact_dir}}/implement/` for this run's artifacts (creating it if
