@@ -24,7 +24,7 @@ pattern = "^/"
 [vars.formula_id]
 description = """\
 User-chosen run identifier (need not be a pre-existing bead) that groups this run's \
-artifacts under ~/dev/cities/gc-artifacts/<formula_id>/{investigate,experiment,implement}/."""
+artifacts under ~/dev/cities/runs/<formula_id>/{investigate,experiment,implement}/."""
 required = true
 pattern = "^[A-Za-z0-9_.-]+$"
 

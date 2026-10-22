@@ -114,7 +114,7 @@ prove an untested model or hardware configuration.
 ## Deliver the patch and handoff
 
 Use the task's artifact directory, or default to
-`~/dev/cities/gc-artifacts/implementations/{{ .RigName }}/<claimed-bead-id>/`.
+`~/dev/cities/runs/implementations/{{ .RigName }}/<claimed-bead-id>/`.
 Write `implementation.md`
 with input provenance, the selected fix and alternatives, files changed,
 worktree/branch/base commit, test commands/results, remaining limitations,

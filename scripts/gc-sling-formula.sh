@@ -5,7 +5,7 @@ if [ $# -lt 2 ]; then
   echo "Usage: $0 <target> <formula-name> [gc sling flags/vars...]" >&2
   echo "Derives --var artifact_dir=... automatically unless one is already supplied." >&2
   echo "If --var formula_id=<id> is passed, artifact_dir defaults to" >&2
-  echo "~/dev/cities/gc-artifacts/<formula_id> with investigate/experiment/implement" >&2
+  echo "~/dev/cities/runs/<formula_id> with investigate/experiment/implement" >&2
   echo "subdirs." >&2
   exit 1
 fi
@@ -33,7 +33,7 @@ for ((i = 0; i < ${#args[@]}; i++)); do
 done
 
 if [ "$has_artifact_dir" -eq 0 ]; then
-  artifacts_root="$HOME/dev/cities/gc-artifacts"
+  artifacts_root="$HOME/dev/cities/runs"
   if [ -n "$formula_id" ]; then
     artifact_dir="$artifacts_root/$formula_id"
   else

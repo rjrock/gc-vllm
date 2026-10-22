@@ -38,7 +38,7 @@ gc session new <rig>/experimentation.experimenter
 ```
 
 Experiment records and raw output default to
-`~/dev/cities/gc-artifacts/experiments/<rig>/<bead-id-or-task-slug>/`; routed
+`~/dev/cities/runs/experiments/<rig>/<bead-id-or-task-slug>/`; routed
 tasks also record their findings and artifact paths in bead notes.
 
 To check the configuration and rendered prompt:

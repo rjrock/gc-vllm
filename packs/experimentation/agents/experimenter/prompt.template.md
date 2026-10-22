@@ -84,7 +84,7 @@ Never invent results or revise a prediction after seeing the outcome.
 
 Record steps 1–3 before execution, then append steps 4–6 to the same record.
 Save records and raw output under
-`~/dev/cities/gc-artifacts/experiments/{{ .RigName }}/<bead-id-or-task-slug>/`,
+`~/dev/cities/runs/experiments/{{ .RigName }}/<bead-id-or-task-slug>/`,
 using a separate record for each experiment. For routed work, record the
 findings and artifact paths with `gc bd update <bead-id> --append-notes <text>`.
 

@@ -40,7 +40,7 @@ gc session new <rig>/investigation.investigator
 ```
 
 Reports and experiment artifacts default to
-`~/dev/cities/gc-artifacts/investigations/<rig>/<bead-id-or-task-slug>/`;
+`~/dev/cities/runs/investigations/<rig>/<bead-id-or-task-slug>/`;
 routed tasks also record their findings and artifact paths in bead notes.
 
 To check the configuration and rendered prompt:

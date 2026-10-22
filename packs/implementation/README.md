@@ -42,7 +42,7 @@ Worktrees default to
 `~/dev/cities/gc-worktrees/<rig>/<implementation-step-bead-id>/` on branch
 `implement/<implementation-step-bead-id>`. Reports and patches use the
 supplied artifact directory, or default to
-`~/dev/cities/gc-artifacts/implementations/<rig>/<bead-id>/` for direct
+`~/dev/cities/runs/implementations/<rig>/<bead-id>/` for direct
 tasks. The agent leaves changes in its worktree for review. Publication
 requires explicit task scope.
 

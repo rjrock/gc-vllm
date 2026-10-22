@@ -9,7 +9,7 @@ fi
 formula="$1"
 formula_id="${2:-}"
 
-artifacts_root="$HOME/dev/cities/gc-artifacts"
+artifacts_root="$HOME/dev/cities/runs"
 
 if [ -n "$formula_id" ]; then
   dir="$artifacts_root/$formula_id"
