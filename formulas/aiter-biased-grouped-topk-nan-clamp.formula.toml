@@ -1,0 +1,543 @@
+formula = "aiter-biased-grouped-topk-nan-clamp"
+version = 1
+description = """\
+Investigate -> experiment -> implement a fix for aiter's `biased_grouped_topk` HIP kernel \
+(csrc/kernels/topk_softmax_kernels_group.cu) propagating NaN/Inf gating logits into \
+non-finite topk_weights on MI300 (gfx942), reached via vLLM's fused_topk_bias() dispatch \
+when VLLM_ROCM_USE_AITER=1 and scoring_func=sigmoid. Surfaced by Buildkite build \
+https://buildkite.com/vllm/amd-ci/builds/14875 (job \
+01a14a99-0b5d-4012-b983-7e995c59f148, 'mi300_1: (MI300) MoE Kernels Shard 1', a \
+scheduled weekly 'AITER ON Full CI Run'), where \
+tests/kernels/moe/test_fused_topk.py::test_fused_topk_bias_nan_inf_clamp[...-sigmoid-...] \
+fails with non-finite topk_weights. Fetch the build/job via the Buildkite API using your \
+own credentials if you need to re-confirm log details; do not hardcode any token in this \
+formula or its artifacts."""
+
+[requires]
+formula_compiler = ">=2.0.0"
+
+[vars.artifact_dir]
+description = "Absolute, shared artifact directory, unique to this workflow run."
+required = true
+pattern = "^/"
+
+[vars.formula_id]
+description = """\
+User-chosen run identifier (need not be a pre-existing bead) that groups this run's \
+artifacts under ~/dev/cities/gc-artifacts/<formula_id>/{investigate,experiment,implement}/."""
+required = true
+pattern = "^[A-Za-z0-9_.-]+$"
+
+[vars.image]
+description = """\
+Local docker image to reproduce and validate in. Already present locally (no pull \
+needed): image ID 391909d1ae22, 46.6GB. Contains an editable vllm at /root/dev/vllm (git \
+HEAD 57d9bf768e0e3e2153acc3b01ae3fda3b7393ded) and a NON-editable wheel-installed \
+amd-aiter 0.1.26 at /usr/local/lib/python3.12/dist-packages/aiter (+ aiter_meta/ + \
+dist-info); /root/dev has no aiter source checkout at all. Build toolchain present: \
+hipcc (HIP 7.15.26333), ninja, gcc 11.4.0, git, torch 2.13.0+rocm10.0.0. Env vars baked \
+in: AITER_ROCM_ARCH=gfx942;gfx950, PYTORCH_ROCM_ARCH=gfx90a;gfx942;gfx950, \
+ROCM_PATH=/usr/local/lib/python3.12/dist-packages/_rocm_sdk_devel. Verify it is still \
+present locally with `docker image inspect {{image}}` before using it; do not pull."""
+default = "rjrock2/vllm-ci-ext:oct21"
+
+[vars.repo_path]
+description = """\
+Host aiter checkout (registered as the aiter rig). Read-only context for the \
+investigator; all edits happen in a dedicated rig worktree, never here."""
+default = "/home/ryrock/dev/aiter"
+pattern = "^(/.*)?$"
+
+[vars.vllm_repo_path]
+description = """\
+Host vllm checkout (registered as the vllm rig). Read-only context; used to inspect the \
+dispatch chain and run the regression test suite. All edits (if any are needed on the \
+vLLM side) happen in a dedicated rig worktree, never here."""
+default = "/home/ryrock/dev/vllm"
+pattern = "^(/.*)?$"
+
+[vars.base_ref]
+description = """\
+Optional implementation base ref for the aiter worktree. Empty means: use the aiter \
+rig's tip-of-tree default branch (main)."""
+default = ""
+
+[vars.question]
+description = "Optional extra focus or hints."
+default = ""
+
+[vars.constraints]
+description = "Optional implementation focus, validation requirements, and resource limits."
+default = '''Scope this fix to aiter's biased_grouped_topk HIP kernel (the sigmoid+bias
+dispatch path exercised by test_fused_topk_bias_nan_inf_clamp[...-sigmoid-...]). A
+SEPARATE, already-tracked bug (formula aiter-topk_sigmoid-pybind, a JIT-binding
+SyntaxError in aiter's unrelated topk_sigmoid/moe_topk_ck op) fully explains every
+test_fused_topk_nan_inf_clamp[...-sigmoid-...] (non-bias) failure in the same Buildkite
+job -- do not re-investigate or re-fix that cluster here; it is out of scope.
+A third, DISTINCT cluster also appears in the same job:
+test_fused_topk_bias_nan_inf_clamp[...-softmax-...] failures. Read
+vllm/model_executor/layers/fused_moe/router/fused_topk_bias_router.py's fused_topk_bias()
+and confirm: for scoring_func="softmax", there is no AITER-specific dispatch branch at
+all (only "sigmoid" and "sqrtsoftplus" get aiter-specific handling when
+rocm_aiter_ops.is_fused_moe_enabled()), so these cases fall through to the final plain
+torch implementation (gating_output.softmax(dim=-1) -> optional bias add ->
+torch.topk -> gather -> optional renormalize) regardless of VLLM_ROCM_USE_AITER, and
+that implementation has zero NaN/Inf clamping. If the investigation confirms this
+reproduces identically with VLLM_ROCM_USE_AITER=0, it is a vLLM-side bug, not an aiter
+one -- note it clearly as a distinct, out-of-scope finding for a separate follow-up
+rather than folding a fix for it into this workflow, unless it turns out to share a root
+cause with the in-scope aiter kernel gap (verify, don't assume either way).'''
+
+[vars.known_context]
+description = "What is already known about this failure, as unverified context to confirm, not an established fact."
+default = '''Source: Buildkite build https://buildkite.com/vllm/amd-ci/builds/14875
+(job 01a14a99-0b5d-4012-b983-7e995c59f148, 'mi300_1: (MI300) MoE Kernels Shard 1'). The
+build's metadata shows message "AITER ON Full CI Run - weekly", source "schedule" -- a
+special scheduled run that force-enables AITER globally via a build-level Buildkite env
+var (`"env": {"VLLM_ROCM_USE_AITER": "1", "NIGHTLY": "1"}`), applied to every job/command
+in the build because this job runs under the native-kubernetes CI runtime
+(.buildkite/scripts/hardware_ci/run-amd-test.sh's is_native_runtime() branch, which runs
+test commands directly via bash in the pod rather than through `docker run -e` passthrough,
+so build-level env flows straight through). VLLM_ROCM_USE_AITER defaults to False
+(vllm/envs.py) and is not force-enabled in ordinary per-PR CI, which is suspected to be
+why this gap has not surfaced before.
+
+Dispatch chain, read from source (not yet empirically re-confirmed inside {{image}} this
+run -- verify against whatever commit the image/rigs actually carry):
+- vllm/model_executor/layers/fused_moe/router/fused_topk_bias_router.py: fused_topk_bias()
+  with rocm_aiter_ops.is_fused_moe_enabled() and scoring_func == "sigmoid" calls
+  rocm_aiter_ops.biased_grouped_topk(...) (gated by _aiter_can_use_biased_grouped_topk,
+  which checks topk >= num_expert_group and num_expert_group in {1,2,4,8}) -- this is a
+  DIFFERENT aiter entry point from topk_sigmoid (unaffected by the separately-tracked
+  pybind SyntaxError bug; biased_grouped_topk is bound via the MOE_OP_PYBIND macro in
+  csrc/include/rocm_ops.hpp, which correctly uses torch.Tensor-compatible pybind).
+- aiter/ops/topk.py's biased_grouped_topk() Python wrapper dispatches (for MI300/gfx942,
+  no AITER_FLYDSL_USE_HERD, not gfx1250) to biased_grouped_topk_hip, JIT-compiled via
+  @compile_ops("module_moe_asm", fc_name="biased_grouped_topk", develop=True), backed by
+  the C++ biased_grouped_topk() host function in
+  aiter/csrc/kernels/topk_softmax_kernels_group.cu (near its end, ~line 1723), which
+  dispatches through the LAUNCH_KERNEL() macro chain (LAUNCHER_TOPK_REG -> LAUNCHER2 ->
+  LAUNCHER3 -> LAUNCHER4) to one of three __global__ kernels: topk_reg_kernel (register-
+  resident fast path, ~line 744), grouped_topk_kernel (general/LDS path, ~line 444, used
+  when NUM_GRP==1 i.e. num_expert_group==1), or grouped_topk_opt_sort_kernel (~line 1034,
+  used only when use_opt_sort is true, which host-side biased_grouped_topk() hardcodes to
+  require topk==8, num_expert_group==8, num_experts==256 -- never true for this test's
+  shapes).
+- The register-resident topk_reg_kernel's LAUNCHER_TOPK_REG() gate requires
+  num_experts % 64 == 0 (among other conditions); the failing test's num_experts values
+  are 6, 8, 16 -- none divisible by 64 -- so topk_reg_kernel is suspected to never be
+  selected for these shapes, falling through to grouped_topk_kernel (general/LDS path)
+  for NUM_GRP==1, or possibly the opt_sort kernel's sibling non-opt path for NUM_GRP>1 --
+  the exact selected kernel per failing [num_experts, topk] combination is NOT yet
+  empirically confirmed and should be verified directly (e.g. via printf debugging or
+  reading the actual NUM_GRP value _aiter_get_num_expert_group(num_experts) picks for
+  each failing shape), not assumed from this static analysis alone.
+- NaN/Inf handling found so far by grep across
+  aiter/csrc/kernels/topk_softmax_kernels_group.cu: exactly ONE line (~1120), inside
+  grouped_topk_kernel's biased+non-softmax (sigmoid) score-computation block:
+  `gating[i] = ::isnan(gating[i]) ? -INFINITY : gating[i];` -- applied only to the
+  bias-shifted `gating` array, NOT to `sig_scores`/`sig_vec` (the pre-bias sigmoid value
+  used later as the output weight when a group wins), and it does not call `::isinf()`
+  at all, so a +inf input logit passes through unclamped. topk_reg_kernel (~line 744-1026)
+  and grouped_topk_opt_sort_kernel (~line 1034-1512) appear to have NO NaN/Inf handling
+  whatsoever (confirmed by grep for isnan/isinf across their line ranges, matches: none).
+  aiter/csrc/kernels/topk_softmax_kernels.cu (a separate, non-"_group" file backing
+  aiter's plain topk_softmax/moeSoftmax/moeTopK, NOT grouped_topk/biased_grouped_topk)
+  also has zero isnan/isinf handling anywhere, confirmed by grep.
+- Contrast: vLLM's own native csrc/moe/topk_softmax_kernels.cu has an explicit,
+  unconditional NaN/Inf-to-0 clamp applied to both its moeSoftmax/moeSigmoid device
+  functions (~lines 136, 159: `if (isnan(x) || isinf(x)) x = 0.f;`) and its vectorized
+  topkGating kernel (~lines 466-474, comment: "Fix: clamp NaN/Inf values to 0 to prevent
+  duplicate expert IDs... With 0s, the argmax uses index tie-breaking to pick
+  [0,1,2,...,k-1]."). This is the convention the regression tests
+  (test_fused_topk_nan_inf_clamp / test_fused_topk_bias_nan_inf_clamp in
+  tests/kernels/moe/test_fused_topk.py, added as "Regression test for the NaN/Inf clamp
+  in topk_softmax_kernels.cu") were written to protect for vLLM's OWN kernels -- the
+  protection does not extend to aiter's kernels, which are a different, independently
+  maintained implementation.
+- Exact observed failures from the build 14875 log (dtype x bad_value x scoring_func x
+  topk x num_experts), sigmoid+bias cluster only (softmax+bias cluster is the separate,
+  possibly-out-of-scope item described in {{constraints}}):
+  test_fused_topk_bias_nan_inf_clamp[dtype1-nan-sigmoid-4-8],
+  test_fused_topk_bias_nan_inf_clamp[dtype2-nan-sigmoid-3-16],
+  test_fused_topk_bias_nan_inf_clamp[dtype2-nan-sigmoid-4-6] all failed with
+  "Row 1 has non-finite weights [nan, ...] (bad_value=nan, scoring_func=sigmoid)" --
+  i.e. NaN input logits produce NaN output weights (not merely duplicate IDs), meaning
+  whatever partial clamp exists on this path does not prevent non-finite weights from
+  reaching the output for these particular shapes/dtypes. Notably,
+  test_fused_topk_bias_nan_inf_clamp[dtype1-inf-sigmoid-3-16] and
+  [dtype1-inf-sigmoid-4-16] PASSED in the same run -- confirming the bug is inconsistent
+  across shapes/dtypes/bad_value kind (nan vs inf), consistent with different kernels
+  (or different code paths within one kernel) being selected for different
+  num_experts/topk/NUM_GRP combinations, only some of which hit the line-~1120 partial
+  clamp or hit it in a way that is insufficient.
+- Test reference (torch_topk in tests/kernels/moe/test_fused_topk.py) and the test
+  bodies themselves (test_fused_topk_bias_nan_inf_clamp, ~lines 217-277) construct
+  gating_output with row 0 normal and rows 1..3 fully poisoned with a single bad_value
+  (nan or inf) broadcast across all experts in those rows, then assert finite weights
+  and topk-unique-count-many unique expert IDs for the poisoned rows.'''
+
+[vars.editable_mode_notes]
+description = """\
+How aiter distinguishes a true editable/develop install from a frozen wheel install, and \
+what the investigator/experimenter/implementer must use to overwrite and verify it."""
+default = '''aiter's setup.py decides packaging mode from argv: `is_develop_mode()`
+(setup.py) is True when invoked as `python setup.py develop` or with any arg containing
+"editable" (i.e. `pip install -e .`). `write_install_mode()` then writes a plain-text file
+`<aiter-package-dir>/install_mode` containing literally `develop` or `install`.
+For a REGULAR (non-develop) install, `prepare_packaging()` copies 3rdparty/, hsa/,
+gradlib/, csrc/ into a separate `aiter_meta/` tree next to the installed package and
+strips .gitignored asm dumps; develop mode skips this entirely (no aiter_meta copy is
+made).
+At import time, aiter/jit/core.py reads `{this_dir}/../install_mode`: if its content is
+"develop", `AITER_META_DIR` is set to `AITER_ROOT_DIR` (the source tree itself, used
+directly for JIT builds -- true editable mode); otherwise `AITER_META_DIR` is the
+separate `aiter_meta/` copy. A missing install_mode file defaults to develop-mode
+behavior.
+To genuinely put the image's aiter into editable/develop mode against a tip-of-tree
+checkout: get a tip-of-tree aiter source tree into the container (bind mount the rig
+worktree, read-write -- aiter's JIT writes build artifacts back into its own source tree
+at runtime, so a read-only mount silently breaks this), uninstall/remove the existing
+non-editable amd-aiter wheel install (package dir, aiter_meta/, and its dist-info) from
+site-packages, then run `python setup.py develop` (or `pip install -e .`, which
+additionally needs `./.github/scripts/install_triton.sh` per aiter's CONTRIBUTE.md for
+the full Python+HIP/CK kernel path) FROM the mounted worktree. Also clear BOTH JIT `.so`
+cache locations before rebuilding, or a stale build silently persists across source
+edits: `aiter/jit/build/<module>/build/<module>.so` AND the separate copy
+aiter/jit/core.py actually imports from, `aiter/jit/<module>.so` (gitignored, directly
+in the package dir) -- for this op that module is `module_moe_asm`. Verify genuine
+editable mode by: (a) `python -c "import aiter; print(aiter.__file__)"` resolving inside
+the mounted worktree, not dist-packages; (b) the worktree's own `aiter/install_mode`
+file (not a copy) reading "develop"; (c) confirming no `aiter_meta/` tree was
+created/used -- JIT builds must read source directly from the mounted worktree root.'''
+
+[vars.gpu_rules]
+description = "Rules for using the local GPUs safely."
+default = '''LOCAL GPU RULES (this host has 8 MI300X GPUs, shared with other users).
+1. Use ONE GPU per container. Before every launch run `rocm-smi --showuse` and
+   `rocm-smi --showmeminfo vram`; pick a GPU with 0% use and ~no VRAM held.
+   Never use a busy GPU. Record the index in your report. Importing aiter
+   without real GPU access (no --device mapping) fails with "RuntimeError: No
+   gfx arch found in rocminfo output" -- this is expected and not itself a bug;
+   always run with real device access for anything beyond a plain syntax check.
+2. Run containers with `--device=/dev/kfd --device=/dev/dri --group-add video
+   --security-opt seccomp=unconfined --ipc=host --shm-size=16g` and
+   `-e HIP_VISIBLE_DEVICES=<idx>`, name them with your claimed bead ID, use
+   `--entrypoint bash` (the image entrypoint is not a shell), and `docker rm -f`
+   them when done, on every error path.
+3. aiter JIT-compiles kernels on first use and can take minutes; allow for it.
+   Keep each experiment's JIT cache isolated (a per-bead cache directory) to
+   avoid cross-experiment contamination.
+4. Do not modify the image. Do not run `docker commit` over `{{image}}`. The
+   editable-mode overwrite this task requires happens by bind-mounting a
+   writable tip-of-tree aiter worktree into the container and running the
+   install there, at container-run time; the underlying image is never
+   altered. Mount the worktree READ-WRITE (never `:ro`): aiter's JIT writes
+   generated build artifacts back into its own source tree, and a read-only
+   mount silently breaks editable-mode JIT builds.
+5. Disk: `/`, `/tmp`, `/root` share one overlay filesystem on this host (about
+   3.5T total; check `df -h` before large builds).'''
+
+[[steps]]
+id = "body"
+title = "Investigate, experiment, and fix aiter biased_grouped_topk's incomplete NaN/Inf clamp"
+needs = ["implement"]
+metadata = { "gc.kind" = "scope", "gc.scope_name" = "aiter-biased-grouped-topk-nan-clamp", "gc.scope_role" = "body" }
+
+[[steps]]
+id = "investigate"
+title = "Investigate aiter biased_grouped_topk's NaN/Inf propagation into non-finite topk_weights"
+needs = []
+metadata = { "gc.run_target" = "aiter/investigation.investigator", "gc.scope_ref" = "body", "gc.scope_role" = "member", "gc.on_fail" = "abort_scope" }
+description = """
+Investigate the failure: on MI300 (gfx942), with VLLM_ROCM_USE_AITER=1 and
+scoring_func="sigmoid", vLLM's `tests/kernels/moe/test_fused_topk.py::
+test_fused_topk_bias_nan_inf_clamp[...]` fails for several (num_experts, topk,
+dtype, bad_value) combinations because `rocm_aiter_ops.biased_grouped_topk`
+(aiter's HIP kernel in csrc/kernels/topk_softmax_kernels_group.cu) propagates
+NaN/Inf gating logits into non-finite topk_weights, instead of clamping them
+the way vLLM's own native topk_softmax_kernels.cu does. This workflow requires
+you to first overwrite the target image's installed aiter with a tip-of-tree
+checkout in true editable/develop mode, and reproduce/diagnose the bug against
+THAT editable install, not the image's stock wheel install.
+
+Context, as unverified claims to confirm (not established facts):
+
+{{known_context}}
+
+Scope and exclusions: {{constraints}}
+
+How aiter's editable/develop mode works, and how to put the image's aiter into
+it against a tip-of-tree checkout (including the two separate JIT `.so` cache
+locations that must both be cleared to force a genuine rebuild of
+module_moe_asm):
+
+{{editable_mode_notes}}
+
+Environment: use the local docker image `{{image}}` (already present locally;
+do not pull). Resolve the aiter rig's source repository and tip-of-tree commit
+using `gc rig list --json` (registered path hint: {{repo_path}}); do not
+assume this hint is accurate without verifying it against the rig
+registration. Resolve the vllm rig/source the same way (registered path hint:
+{{vllm_repo_path}}) for the test suite and dispatch-chain source
+(fused_topk_bias_router.py, _aiter_ops.py) -- do not assume paths or line
+numbers from {{known_context}} are current without re-checking them in the
+resolved repo at its actual commit.
+
+{{gpu_rules}}
+
+Additional focus or hints: {{question}}
+
+Diagnose only; follow your agent's isolation rules and do not implement a fix
+in this step. Do the editable-mode overwrite in your own isolated worktree
+(never the shared aiter checkout) at
+`~/dev/cities/gc-worktrees/aiter/{{formula_id}}/investigate/<claimed-bead-id>`
+on branch `{{formula_id}}/investigate/<claimed-bead-id>`, per your pack's
+worktree protocol, and bind-mount that worktree read-write into the container
+to perform the `setup.py develop` (or `pip install -e .`) overwrite and all
+testing. Confirm genuine editable mode (aiter.__file__ location, install_mode
+file content, absence of a used aiter_meta/ tree) before treating any
+reproduction as valid.
+
+Reproduce the smallest failing case first: a direct Python script that calls
+`aiter.biased_grouped_topk` (or `rocm_aiter_ops.biased_grouped_topk`) on a
+minimal gating_output tensor shaped like one of the failing test cases (e.g.
+num_experts=8, topk=4, a NaN-poisoned row), before re-running the full
+parametrized vLLM suite. For each failing (num_experts, topk, dtype,
+bad_value) combination from {{known_context}}, determine empirically which of
+the three __global__ kernels (topk_reg_kernel, grouped_topk_kernel,
+grouped_topk_opt_sort_kernel) is actually dispatched -- by reading the
+LAUNCHER_TOPK_REG/LAUNCHER2/LAUNCHER3/LAUNCHER4 macro chain in
+csrc/kernels/topk_softmax_kernels_group.cu alongside the host-side
+`biased_grouped_topk()` function's computation of `num_expert_group`,
+`use_opt_sort`, and the register-path gate conditions for the ACTUAL shapes
+used, not assumed ones -- and confirm by direct inspection (e.g. adding a
+temporary printf/assert in your worktree, or stepping through with a debugger)
+rather than static reasoning alone. For each dispatched kernel, trace exactly
+where (if anywhere) a NaN or Inf input logit is clamped or allowed to survive
+into `sig_scores`/`gating`/the final `topk_weights` write, and explain why the
+PASSING cases (e.g. dtype1-inf-sigmoid-3-16, dtype1-inf-sigmoid-4-16 per
+{{known_context}}) differ from the FAILING ones -- this contrast is likely the
+fastest path to the precise defect. Separately, read
+fused_topk_bias_router.py's fused_topk_bias() to confirm whether the
+softmax+bias cluster noted in {{constraints}} is genuinely AITER-independent
+(reproduces identically with VLLM_ROCM_USE_AITER=0) or shares a root cause
+with the sigmoid+bias kernel bug; report this clearly either way without
+necessarily fixing it, per {{constraints}}.
+
+Use `{{artifact_dir}}` as the shared directory for this run. Write your
+artifacts under `{{artifact_dir}}/investigate/`, creating that subdirectory if
+needed; it must not contain an earlier run's reports. Do not overwrite
+existing files.
+
+Before closing this step, write `{{artifact_dir}}/investigate/investigation.md` with:
+- Your claimed bead ID, the aiter and vllm tip-of-tree commits used, and date.
+- The exact reproduction command, container name/flags, GPU index, environment
+  variables, versions; mark missing information.
+- The exact steps used to overwrite the image's aiter with the editable
+  tip-of-tree checkout (worktree path/branch, mount flags, install command run
+  inside the container, both JIT cache locations cleared, and the three
+  editable-mode verification checks and their results).
+- Fresh findings with file:line references (in the aiter and vllm worktrees)
+  and raw output paths, including the empirically-confirmed kernel dispatch
+  per failing shape and the exact point(s) where NaN/Inf survives. Separate
+  fresh observations from the supplied context and from untested hypotheses.
+- Ranked root-cause hypotheses with confidence, alternatives, and missing
+  evidence -- specifically, whether a single fix (e.g. extending the
+  line-~1120-style clamp to all three kernels, to both `gating` and
+  `sig_scores`/`sig_vec`, and to `isinf` as well as `isnan`) is sufficient, or
+  whether different kernels need different treatment.
+- Your finding on the softmax+bias cluster's relationship (or lack thereof) to
+  this kernel bug, per the scope note in {{constraints}}.
+- A minimal experiment plan for the experimenter: hypothesis, prediction,
+  control, exact commands, distinguishing result.
+- Explicit confirmation of what is and is not in scope per {{constraints}}.
+
+Append the handoff summary and absolute report path to this claimed step's
+notes with `gc bd update <claimed-bead-id> --append-notes <text>` and record
+`--set-metadata investigation.report_path=<path>`. Verify the report is
+readable, then set `gc.outcome=pass` on this claimed step and close only it.
+
+If blocked (image missing, no idle GPU, cannot produce a usable handoff),
+append the reason, set `gc.outcome=fail` and `gc.failure_reason=<reason>`, and
+close only this step. Do not close the workflow root.
+"""
+
+[[steps]]
+id = "experiment"
+title = "Validate the biased_grouped_topk NaN/Inf clamp investigation with minimal experiments"
+needs = ["investigate"]
+metadata = { "gc.run_target" = "aiter/experimentation.experimenter", "gc.scope_ref" = "body", "gc.scope_role" = "member", "gc.on_fail" = "abort_scope" }
+description = """
+Read `{{artifact_dir}}/investigate/investigation.md` before running anything.
+Read the producer bead ID recorded in it, and verify it belongs to the same
+`gc.root_bead_id` as your claimed step and has `gc.outcome=pass`. Test
+environment: docker image `{{image}}`.
+
+Scope and exclusions: {{constraints}}
+
+{{gpu_rules}}
+
+Additional focus or hints: {{question}}
+
+If this experiment needs source changes, use a worktree at
+`~/dev/cities/gc-worktrees/aiter/{{formula_id}}/experiment/<claimed-bead-id>`
+on branch `{{formula_id}}/experiment/<claimed-bead-id>`, per your pack's
+worktree protocol.
+
+Test the handoff's hypotheses; do not assume its conclusions are correct,
+including whether its claimed editable-mode overwrite is genuinely in effect
+-- re-verify it yourself (aiter.__file__, install_mode file content, no
+aiter_meta/ tree in use) before trusting any reproduction built on top of it.
+Follow your six-step protocol for every experiment: hypothesis, prediction
+(recorded before running), exact command/environment, run, actual result,
+verdict (supports / contradicts / inconclusive). Prefer the smallest
+experiments that separate the hypotheses, for example:
+- Confirm each failing (num_experts, topk, dtype, bad_value) case from the
+  investigation reproduces against the editable tip-of-tree aiter overwrite,
+  by calling `aiter.biased_grouped_topk` directly on a minimal poisoned
+  gating_output tensor and comparing to vLLM's torch reference
+  (gather/renormalize semantics from torch_topk in test_fused_topk.py),
+  outside any larger test harness.
+- For the investigation's identified dispatched kernel(s), test the candidate
+  fix direction (e.g. clamping NaN AND Inf, on BOTH `gating` and
+  `sig_scores`/`sig_vec`, in whichever kernel(s) the failing shapes actually
+  use) by editing the kernel source in your experiment worktree and rebuilding
+  (JIT recompiles `module_moe_asm` automatically on next import in true
+  develop mode after clearing its `.so` cache) -- include a control showing
+  the unmodified worktree still fails identically.
+- If multiple kernels (topk_reg_kernel, grouped_topk_kernel,
+  grouped_topk_opt_sort_kernel) are implicated across different shapes,
+  confirm whether a clamp added to only one is sufficient for the specific
+  failing cases in this job, or whether all three need it for general
+  correctness -- and note explicitly which kernels your fix covers versus
+  leaves unclamped (scope/limitations must be visible to the implementer).
+- Check the clamp-to-value choice: vLLM's native convention clamps NaN/Inf to
+  0 before argmax/topk (relying on index tie-breaking for uniqueness); aiter's
+  existing partial clamp uses `-INFINITY` instead. Test whether clamping to 0
+  (matching vLLM's own convention and the test's expectations) versus
+  `-INFINITY` changes correctness or uniqueness of selected expert IDs for the
+  poisoned rows, especially when ALL experts in a row are poisoned (every
+  candidate becomes the same clamped value).
+- Run the full `tests/kernels/moe/test_fused_topk.py -k "sigmoid and bias"`
+  (or equivalent -k selection covering test_fused_topk_bias_nan_inf_clamp)
+  suite with the candidate fix applied and confirm the previously-failing
+  sigmoid+bias cases clear, while explicitly out-of-scope clusters per
+  {{constraints}} are left unaffected either way (note, don't fix, any change
+  in those clusters' results).
+
+Save experiment records and raw output under `{{artifact_dir}}/experiment/`
+(creating it if needed) and write `{{artifact_dir}}/experiment/experiments.md`
+with the producer bead ID, every experiment's six steps, evidence paths,
+verdicts, uncertainties, and a recommended fix direction naming the source
+file(s), exact kernel(s)/line(s), the change, and the tested revision. Do not
+implement the production fix in the shared aiter checkout; candidate edits
+belong only in your own experiment worktree.
+
+Append the summary and absolute artifact paths to this claimed step's notes
+with `gc bd update <claimed-bead-id> --append-notes <text>`, set
+`experiment.report_path=<path>` and `gc.outcome=pass`, and close only this
+step. `pass` means the experiments were completed, even if a hypothesis is
+contradicted or inconclusive.
+
+If the handoff is missing, stale, or unusable, or runtime resources prevent
+execution, record the blocker, set `gc.outcome=fail` and
+`gc.failure_reason=<reason>`, and close only this step. Do not fabricate
+results or close earlier steps or the workflow root.
+"""
+
+[[steps]]
+id = "implement"
+title = "Implement, validate, and commit the biased_grouped_topk NaN/Inf clamp fix, keeping tip-of-tree editable mode as the validation environment"
+needs = ["experiment"]
+metadata = { "gc.run_target" = "aiter/implementation.implementer", "gc.scope_ref" = "body", "gc.scope_role" = "member", "gc.on_fail" = "abort_scope" }
+description = """
+Read `{{artifact_dir}}/experiment/experiments.md`, the producer experiment
+bead, and the investigation artifacts it cites. Verify the investigation and
+experiment step beads belong to your `gc.root_bead_id`, completed with
+`gc.outcome=pass`, and recorded the report paths you are reading; record their
+IDs and paths on your claimed step.
+
+Additional scope and resource constraints: {{constraints}}
+
+{{gpu_rules}}
+
+Choose the smallest coherent root-cause fix supported by the experiments.
+Prefer matching vLLM's own established convention in csrc/moe/topk_softmax_kernels.cu
+(clamp NaN/Inf to 0 before argmax/topk, relying on index tie-breaking for
+uniqueness) over inventing a new convention, unless the experiments show this
+is insufficient or incorrect for aiter's grouped/biased selection logic. Apply
+the fix to every kernel the experiments identify as reachable by the failing
+shapes (do not silently fix only one kernel if the experiments show multiple
+are implicated) -- if resource limits force a narrower fix, state exactly
+which kernels/shapes remain unprotected. The owning repository is the aiter
+rig (registered path hint {{repo_path}}; resolve the authoritative path via
+`gc rig list --json`). Optional base-ref override: {{base_ref}}. If empty, use
+the aiter rig's tip-of-tree default branch.
+
+If the experiments conclude the softmax+bias cluster noted in {{constraints}}
+is a separate vLLM-side bug unrelated to this aiter kernel fix, do NOT fix it
+here -- leave it fully documented as an out-of-scope finding (file path,
+function, and nature of the gap) in your implementation report for a
+follow-up formula, and do not touch vllm source in this step unless the
+experiments concluded a vLLM-side change (e.g. threading renormalize/scaling
+correctly, or a call-site fix) is required to deliver the in-scope
+sigmoid+bias fix itself.
+
+Follow your worktree protocol. Record the shared aiter checkout's dirty
+state, branch/HEAD, and protected main/default-branch refs. Create/recover the
+linked worktree
+`~/dev/cities/gc-worktrees/aiter/{{formula_id}}/implement/<claimed-bead-id>`
+on branch `{{formula_id}}/implement/<claimed-bead-id>`, verifying repository,
+path, ownership, and branch before any edit. Save its absolute path as
+`work_dir` and `implementation.worktree_path`, and record
+`implementation.branch` and `implementation.base_commit`. All edits, builds,
+tests, staging, and commits happen there. Never modify the shared checkout,
+never advance main, never edit the docker image.
+
+Implement the fix with focused regression coverage (e.g. a test exercising
+aiter.biased_grouped_topk directly with NaN- and Inf-poisoned rows across the
+previously-failing shapes, asserting finite weights and unique expert IDs).
+Validate by overwriting `{{image}}`'s installed aiter with YOUR implementation
+worktree in true editable/develop mode (bind-mounted read-write, `python
+setup.py develop` or `pip install -e .` run inside the container against the
+worktree; verify genuine editable mode via aiter.__file__, the worktree's own
+install_mode file reading "develop", and no aiter_meta/ tree in use; clear
+both JIT `.so` cache locations for module_moe_asm before rebuilding):
+1. The original non-finite-weight failure on the baseline (fresh reproduction
+   against the editable overwrite before your fix is applied in the
+   worktree), across every previously-failing (num_experts, topk, dtype,
+   bad_value) combination identified by the investigation/experiments.
+2. Those same cases now producing finite topk_weights and topk-unique expert
+   IDs after your fix, via both the minimal direct-call reproduction and the
+   full `tests/kernels/moe/test_fused_topk.py -k "sigmoid and bias"` (or
+   equivalent) suite (with VLLM_ROCM_USE_AITER=1).
+3. No regression in the passing sigmoid+bias cases, non-bias sigmoid cases
+   (excluded per {{constraints}}, for visibility only), and softmax cases.
+4. The repository's required lint/pre-commit hooks on changed files.
+Report which results are proxy-only and what remains untested (e.g. if GPU
+access only covers a subset of the originally-failing shapes).
+
+After validation passes, recheck the worktree and branch, stage only intended
+files by explicit path, inspect the staged diff, run `git diff --cached
+--check`, and commit on `{{formula_id}}/implement/<claimed-bead-id>` following
+the repo's commit/DCO/hook rules. Never bypass failing hooks. Record the full
+hash as `implementation.commit_hash`. Do not merge, push, or open a PR.
+
+Use `{{artifact_dir}}/implement/` for this run's artifacts (creating it if
+needed). Write `{{artifact_dir}}/implement/implementation.md` (source/producer
+IDs, fix and rationale, repository, worktree/branch/base/fix commits, the
+editable-mode overwrite and verification steps used for validation, validation
+commands and results, limitations -- including which kernels/shapes remain
+unprotected if any, and the softmax+bias cluster's disposition -- and artifact
+paths) and export `{{artifact_dir}}/implement/implementation.patch` with `git
+diff --binary <base-commit> <fix-commit>`. Append the summary and paths to
+your claimed bead, set `implementation.report_path`,
+`implementation.patch_path`, `implementation.commit_hash`, and
+`gc.outcome=pass`, then close only your step.
+
+If no justified fix exists, required validation is unavailable, or committing
+fails, write a partial report with blockers, preserve worktree progress, set
+`gc.outcome=fail` and `gc.failure_reason`, and close only your step. Do not
+close earlier steps or the workflow root.
+"""
