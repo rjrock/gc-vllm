@@ -1,0 +1,614 @@
+formula = "inkling-fp8-kv-rel-attn-dtype-mismatch"
+version = 1
+description = """\
+Investigate -> experiment -> implement a fix for a Triton compilation failure in \
+Inkling's ROCm relative-bias paged-attention kernel when `--kv-cache-dtype=fp8` is \
+used. A nightly serving run of Inkling-FP8-dynamic on an MI300X (gfx942) node, \
+launched with `--kv-cache-dtype=fp8 --enable-expert-parallel \
+--speculative-config={"method":"mtp","num_speculative_tokens":8}` against \
+`vllm/vllm-openai-rocm:nightly`, crashed every TP worker during engine startup \
+(CUDA-graph-capture profiling, not real traffic) with \
+`triton.compiler.errors.CompilationError: ... AssertionError: Both operands must be \
+same dtype. Got bf16 and uint8` at `_inkling_rel_attention_kernel`'s \
+`scores = tl.dot(q, k) * (softmax_scale * log2e)` line \
+(vllm/models/inkling/amd/ops/fa4_rel_attention.py, currently line 215). Fresh code \
+reading (this session, against the exact vllm commit the image was reportedly built \
+from, b272cff368b3a0c733859ab308f7123291cf1489, re-verify this is still accurate) \
+confirms the kernel's `k = tl.load(k_ptr + ...)` has no dtype cast or dequant applied \
+before `tl.dot(q, k)`, so when the KV cache is fp8 (`kv_cache_dtype_str_to_dtype` maps \
+`\"fp8\"` to `torch.uint8` storage, vllm/utils/torch_utils.py:43-44) and Q is `bf16`, \
+Triton's `tl.dot` dtype-match assertion fails outright -- this is a hard compile-time \
+failure, not a silent correctness bug, so every single worker hits it and the engine \
+never starts. A SIBLING code path in the same file, \
+`inkling_rel_attention_split_kv_decode`'s `_split_kv_stage1` kernel \
+(vllm/models/inkling/amd/ops/rel_attention_decode.py, currently line 165: \
+`scores = tl.dot(q, k.to(q.dtype)) * softmax_scale`), already casts `k` to `q`'s dtype \
+before the dot -- strongly suggesting the intended fix shape for the crashing kernel is \
+the same local per-call cast, NOT a cache-wide dtype change. This workflow determines \
+whether a plain `.to(q.dtype)` cast is numerically correct for a genuinely fp8-quantized \
+K (vs. requiring a scale-aware dequant, given fp8 KV cache storage is typically paired \
+with a `k_scale`/`v_scale`, and this model's `InklingAttention.k_scale`/`v_scale` \
+buffers -- registered as constant `1.0`, vllm/models/inkling/amd/attention.py:169-170 -- \
+are read nowhere by the attention call path per a fresh grep this session, meaning no \
+quantization scale currently reaches either kernel at all), then implements and \
+validates whichever shape is correct."""
+
+[requires]
+formula_compiler = ">=2.0.0"
+
+[vars.artifact_dir]
+description = "Absolute, shared artifact directory, unique to this workflow run."
+required = true
+pattern = "^/"
+
+[vars.formula_id]
+description = """\
+Run identifier used to label this run's worktree directories and branches \
+(<rig>/{{formula_id}}/<step>/<bead-id>). Defaults to this formula's name."""
+default = "inkling-fp8-kv-rel-attn-dtype-mismatch"
+pattern = "^[A-Za-z0-9_.-]+$"
+
+[vars.image]
+description = """\
+Local docker image to reproduce and validate in. Verify it is present locally with \
+`docker image inspect {{image}}` before using it; do not pull. Confirmed present and \
+confirmed (this session) to contain the exact buggy kernel source at \
+`/usr/local/lib/python3.12/dist-packages/vllm/models/inkling/amd/ops/fa4_rel_attention.py` \
+(vllm.__version__ 0.32.0rc1.dev100+g77154ca61). The failing nightly run instead pinned \
+`vllm/vllm-openai-rocm@sha256:fdd4e1041ad3f3a9c5bf61f291f934405d7b22bcb841c380dc72235411f4f0c0`, \
+which is NOT present locally (`docker image inspect` on that digest fails) -- re-verify \
+both facts against the live rig before relying on either; if the two images disagree on \
+vllm commit, note the discrepancy rather than silently treating them as equivalent."""
+default = "vllm/vllm-openai-rocm:nightly"
+
+[vars.failing_image_digest]
+description = """\
+The exact image digest the original failing nightly run used (NOT present locally at \
+formula-authoring time -- `docker image inspect` on it fails). Recorded for traceability \
+only; do not attempt to pull it (city policy prefers local images). If the fix needs \
+validating against this exact digest and it genuinely cannot be obtained locally, record \
+that as a noted limitation rather than a blocker, since {{image}} already contains the \
+same buggy kernel source confirmed this session."""
+default = "vllm/vllm-openai-rocm@sha256:fdd4e1041ad3f3a9c5bf61f291f934405d7b22bcb841c380dc72235411f4f0c0"
+
+[vars.vllm_repo_path]
+description = """\
+Host vllm checkout (registered as the vllm rig). Read-only context; the fix lands in a \
+dedicated rig worktree, never here."""
+default = "/home/ryrock/dev/vllm"
+pattern = "^(/.*)?$"
+
+[vars.base_ref]
+description = """\
+Optional implementation base ref for the vllm fix. Empty means: use the vllm rig's \
+tip-of-tree default branch (main)."""
+default = ""
+
+[vars.failing_launch_command]
+description = """\
+The vLLM serve invocation that produced the original crash (from \
+cron/nodes/f22/logs/inkling-fp8-dynamic/2026-10-21/nightly/server.log on node f22), \
+recorded verbatim for building the smallest faithful repro. Re-derive the actually \
+load-bearing flags (the investigation should confirm, e.g. by flag-by-flag ablation, \
+which of these are necessary to reproduce vs. incidental) rather than assuming every \
+flag matters."""
+default = '''vllm serve /data/models/Inkling-FP8-dynamic --host=0.0.0.0 --port=9104 \
+--tensor-parallel-size=8 --trust-remote-code --tokenizer-mode=inkling \
+--kv-cache-dtype=fp8 --enable-expert-parallel --enable-auto-tool-choice \
+--tool-call-parser=inkling --reasoning-parser=inkling \
+--speculative-config={"method":"mtp","num_speculative_tokens":8}'''
+
+[vars.model_path]
+description = """\
+Model weights path used by the failing nightly run. NOT present on this host at \
+formula-authoring time (`/data/models/Inkling-FP8-dynamic` does not exist here -- \
+re-verify; it may be host-specific, present only on node f22). If absent on whichever \
+host/GPU you end up using, do not substitute an unrelated model: either find the actual \
+weights (check other registered model hosts / mounts) or build a minimal dummy-weight \
+Inkling config for kernel-level repro instead (the crash is a compile-time Triton dtype \
+assertion in a kernel reachable from a unit test or tiny synthetic harness -- it does not \
+require real trained weights to reproduce, only a real forward pass with an fp8 KV cache \
+buffer and a bf16 Q tensor of the right shapes)."""
+default = "/data/models/Inkling-FP8-dynamic"
+pattern = "^(/.*)?$"
+
+[vars.question]
+description = "Optional extra focus or hints."
+default = ""
+
+[vars.constraints]
+description = """\
+Optional implementation focus, validation requirements, and resource limits."""
+default = ""
+
+[vars.known_context]
+description = """\
+What is already established from fresh code-reading in this session (NOT GPU-validated \
+yet -- the crash has only been observed via the nightly log, not reproduced live), as \
+evidence to build the investigation on, not a conclusion to copy blindly."""
+default = '''1. The crash: every TP worker (worker TP7/EP7 shown in the captured log; by
+construction of a crashing Triton COMPILATION (not a runtime data-dependent failure),
+every worker with a nonzero batch hits the same compile path identically) raised
+`triton.compiler.errors.CompilationError` with the underlying
+`AssertionError: Both operands must be same dtype. Got bf16 and uint8` at
+`triton/language/semantic.py:1441`'s `assert lhs.dtype == rhs.dtype` inside `tl.dot`,
+during `determine_available_memory` -> `profile_cudagraph_memory` ->
+`capture_model` -> CUDA-graph-capture's `forward_fn(CUDAGraphMode.NONE)` -- i.e.
+startup-time graph-capture profiling, before any real request is served. The engine
+then raised `RuntimeError: Engine core initialization failed`, aborting the whole
+server.
+
+2. Root cause (fresh grep/read this session, vllm/models/inkling/amd/ops/fa4_rel_attention.py,
+`_inkling_rel_attention_kernel`, currently line ~112-289): the non-split-KV path (used
+whenever `use_split_kv_decode(...)` returns False -- see point 4) loads `k` directly
+from `k_ptr` with NO dtype cast or scale-aware dequant:
+```
+k = tl.load(k_ptr + ..., mask=..., other=0.0)
+scores = tl.dot(q, k) * (softmax_scale * log2e)   # line 215, the crash site
+```
+`q` enters already cast to the model's bf16 compute dtype (loaded via
+`tl.load(q_block_ptr, ...)`, no cast either, so it stays whatever dtype `q_ptr`
+actually is -- confirm this is genuinely bf16 for Inkling-FP8-dynamic specifically,
+not assumed). With `--kv-cache-dtype=fp8`, `kv_cache_dtype_str_to_dtype` maps the
+string `"fp8"` to `torch.uint8` STORAGE dtype (vllm/utils/torch_utils.py:43-44;
+`InklingAttention.kv_cache_torch_dtype` in attention.py:166-168 derives this the same
+way other FlashAttentionBackend-based layers do). So `k_ptr` points at `uint8`-typed
+memory and `tl.dot(q, k)` mixes bf16 and uint8 operands, tripping Triton's dtype-match
+assertion at compile time (not even execution time -- this is a `tl.jit` AST->IR
+compile failure, so it is 100% deterministic given these shapes/dtypes, not a rare
+runtime corner case).
+
+3. A SIBLING kernel in the SAME model handles this correctly already:
+`_split_kv_stage1` in vllm/models/inkling/amd/ops/rel_attention_decode.py (currently
+line ~165) does `scores = tl.dot(q, k.to(q.dtype)) * softmax_scale` -- an explicit
+`.to(q.dtype)` cast immediately before the dot. This is the ROCm decode-split path used
+when `use_split_kv_decode(max_query_len=1, ...)` is True (rel_attention_decode.py:48-64:
+requires `max_query_len == 1` AND `page_size >= 64` in the common case). Confirm from
+scratch which of the two kernels CUDA-graph-capture profiling actually exercises for
+each captured shape (it likely profiles BOTH a decode-shape (max_query_len==1) and a
+larger graph-capture shape; a captured `max_query_len > 1` or sliding-window/small-page
+shape would route to `_inkling_rel_attention_kernel`, the crashing one, even if
+single-token decode at serve time would have used the already-safe split-KV path) --
+do not assume the crash is specific to one scheduling regime without checking.
+
+4. A plain `.to(q.dtype)` cast is a VALUE-PRESERVING numeric conversion, not a
+byte-reinterpretation (contrast with the separate, unrelated fn/fnuz
+byte-reinterpretation bug class investigated elsewhere in this project,
+[[glm5next-decode-qk-fnuz-reinterp]] -- that bug involved feeding a tensor into a
+kernel with a MISMATCHED fixed pointer-type signature, which byte-reinterprets without
+converting; this Inkling case is different, `tl.dot` itself is refusing to proceed, and
+a `.to(dtype)` cast on a `torch.uint8`-viewed fp8 tensor is exactly the
+reinterpret-as-fp8-then-convert-to-float pattern Triton's own fp8 support expects --
+e.g. `tl.load(...).to(tl.float8e4) ... .to(tl.bfloat16)` style idioms used elsewhere in
+vllm's Triton kernels, see `triton_unified_attention.py`'s `_cast_kv_tile` helper for a
+MORE complete reference implementation of this same general problem, including a
+per-tensor DEQUANT scale multiply, not just a raw dtype cast).
+
+5. HOWEVER, a critical open question this session did NOT resolve: does a correct fix
+need to be SCALE-AWARE (i.e. `k.to(tl.float8e4...).to(tl.bfloat16) * k_scale`, not just
+a raw `.to(q.dtype)`)? Evidence both ways:
+   a. `InklingAttention` registers `k_scale`/`v_scale` buffers
+      (vllm/models/inkling/amd/attention.py:169-170) as constant `1.0` tensors, and a
+      fresh grep this session found NO call site anywhere in
+      vllm/models/inkling/amd/{attention.py,ops/fa4_rel_attention.py,ops/rel_attention_decode.py}
+      that reads `self.k_scale`/`self.v_scale`/`layer._k_scale`/`layer._v_scale` --
+      i.e. if a nonunity scale were ever calibrated, this model's attention call path
+      has NO wiring to apply it at all, in EITHER kernel (split or non-split). Compare
+      this to `vllm/v1/attention/backends/triton_attn.py`, which DOES wire
+      `layer._k_scale`/`layer._v_scale` into a `k_descale`/`v_descale` argument passed
+      into its unified kernel.
+   b. The ALREADY-WORKING sibling kernel (`_split_kv_stage1`,
+      point 3 above) does a bare `.to(q.dtype)` with NO scale multiply either -- so if
+      that kernel is genuinely exercised today with `--kv-cache-dtype=fp8` on some
+      other Inkling config/shape and is known-correct (or at least not known-broken),
+      that is evidence the existing design intentionally uses a fixed/unity implicit
+      scale for this model's fp8 KV cache, making a bare `.to(q.dtype)` cast
+      structurally consistent with the sibling path, not a parallel bug.
+   c. It is NOT yet established which of (a) or (b) is the right read: maybe the
+      split-KV kernel's own `.to(q.dtype)` is ALSO silently wrong whenever a
+      non-unity scale is calibrated (i.e. this would be a second latent bug, not
+      evidence of a safe pattern) -- the investigation must determine whether
+      `k_scale`/`v_scale` are EVER calibrated to something other than 1.0 for this
+      model/quantization combo (e.g. does the checkpoint's quantization config or
+      vLLM's FP8 KV-cache calibration path set them, even if the attention module
+      never reads them -- if so, that is itself a separate, likely more severe silent
+      correctness bug: scales computed but silently dropped).
+
+6. gfx950/MI350 is NOT affected by this exact code path: `use_gfx950_gluon_decode`/
+`use_gfx950_gluon_extend` (fa4_rel_attention.py:31-61) route gfx950 through entirely
+different vendored Gluon kernels before ever reaching `_inkling_rel_attention_kernel`.
+This crash's generic (non-gfx950) Triton kernel is reached only on gfx942/MI300X (or
+any ROCm arch where neither gfx950 gate matches) -- confirm this guard is actually
+reached (i.e. `on_gfx950()` returns False) on whichever GPU you validate against,
+rather than assuming it.
+
+7. Not yet established, and explicitly left to the investigation: (a) is `k_scale`/
+`v_scale` genuinely unused/dead weight for this model class, or is there an AMD-side
+quantization/calibration hook elsewhere in the model (e.g. MoE or qkvr_prep) that
+feeds a real scale into the KV cache write path that this reasoning missed; (b) what
+exact shapes (BLOCK_Q/BLOCK_K/page_size/batch) CUDA-graph warmup captures for this
+model/TP configuration, to build a minimal, faithful repro; (c) whether
+`--kv-cache-dtype=fp8` was a NEW flag recently added to this nightly recipe (i.e. a
+regression) vs. a long-standing untested combination for Inkling -- check this
+project's own recipe git history (cron/nodes/*/logs or the recipe config under
+cron/recipes, if still present after the recent `cron/recipes -> cron/nodes` move) for
+when `--kv-cache-dtype=fp8` was introduced for Inkling-FP8-dynamic, if at all
+determinable from history.'''
+
+[vars.fallback_host]
+description = """\
+SSH alias for a same-architecture fallback host to use when every local GPU is occupied. \
+Must be reachable via plain `ssh {{fallback_host}} ...` (key-based, no interactive auth)."""
+default = "s79"
+
+[vars.gpu_rules]
+description = "Rules for using the local GPUs safely, with same-arch remote failover."
+default = '''GPU RULES (local host has 8 MI300X GPUs, shared with other users).
+1. Use ONE GPU per container. Before every launch run `rocm-smi --showuse` and
+   `rocm-smi --showmeminfo vram`; pick a GPU with 0% use and ~no VRAM held.
+   Never use a busy GPU. Record the index (and host) in your report. Note: this
+   bug is a hard Triton COMPILE-time failure reachable with a single GPU and a
+   tiny synthetic input -- you do not need all 8 GPUs or true TP=8 to reproduce
+   it; only use more than one GPU if a single-GPU repro genuinely cannot reach
+   the crashing code path (e.g. if the kernel is only ever invoked under
+   enable_expert_parallel + TP>1 scheduling, confirm this before assuming it).
+2. Run containers with `--device=/dev/kfd --device=/dev/dri --group-add video
+   --security-opt seccomp=unconfined --ipc=host --shm-size=16g` and
+   `-e HIP_VISIBLE_DEVICES=<idx>`, name them with your claimed bead ID, use
+   `--entrypoint bash` (the image entrypoint is not a shell), and `docker rm -f`
+   them when done, on every error path.
+3. Triton JIT-compiles kernels on first use and can take minutes; allow for it.
+4. Do not modify the image. Do not run `docker commit` over `{{image}}`. When
+   validating a vllm-side fix, bind-mount your vllm worktree's python sources
+   read-only over /root/dev/vllm (or wherever `vllm.__file__` resolves inside
+   the image -- confirm the actual site-packages path first) inside the
+   container, and confirm `vllm.__file__` points at your mounted sources
+   before trusting any test result.
+5. Disk: `/`, `/tmp`, `/root` share one overlay filesystem on this host (about
+   3.5T total; check `df -h` before large builds).
+
+FALLBACK HOST (use only if step 1 finds every local GPU busy):
+6. `{{fallback_host}}` is a second host with the same GPU architecture
+   (gfx942/MI300X) as local, reachable via `ssh {{fallback_host}} <cmd>`. Before
+   falling back, confirm it is actually needed: a transient busy reading is not
+   enough -- recheck local `rocm-smi --showuse` once more first.
+7. Confirm reachability with `ssh {{fallback_host}} true`. Then pick an idle GPU
+   there the same way as rule 1, but via `ssh {{fallback_host}} rocm-smi
+   --showuse` / `--showmeminfo vram`. If every GPU on both hosts is busy, record
+   that as a blocker rather than waiting or using a busy GPU anywhere.
+8. Check whether `{{image}}` is already present on `{{fallback_host}}` with
+   `ssh {{fallback_host}} docker image inspect {{image}}`. Only if absent,
+   transfer it once via `docker save {{image}} | ssh {{fallback_host}} docker
+   load` (never via a registry push/pull). Do not repeat the transfer if a later
+   check finds the image already present.
+9. Place your worktree/scratch dir on `{{fallback_host}}` under your home
+   directory there (e.g. `~/gc-scratch/<claimed-bead-id>/`), synced from the
+   local copy with `rsync -a --delete`; re-run that rsync after each local edit
+   instead of editing the remote copy directly. Run every docker command for
+   that work via `ssh {{fallback_host}} docker ...` (same flags as rule 2),
+   substituting the remote worktree path for local bind-mounts.
+10. Note in your report which host and GPU index you actually used, and why
+    (local busy, remote chosen) if you fell back.'''
+
+[[steps]]
+id = "body"
+title = """\
+Investigate, experiment, and fix Inkling's ROCm relative-attention Triton kernel \
+dtype-mismatch crash under --kv-cache-dtype=fp8"""
+needs = ["implement"]
+
+[steps.metadata]
+"gc.kind" = "scope"
+"gc.scope_name" = "inkling-fp8-kv-rel-attn-dtype-mismatch"
+"gc.scope_role" = "body"
+
+[[steps]]
+id = "investigate"
+title = """\
+Reproduce the Triton compile-time dtype-mismatch crash and determine the correct, \
+scale-aware or scale-free fix shape for the K operand"""
+needs = []
+description = """
+Re-verify, from scratch, the crash a nightly serving run hit on node f22
+(cron/nodes/f22/logs/inkling-fp8-dynamic/2026-10-21/nightly/server.log): every TP
+worker failed Triton compilation of
+`vllm.models.inkling.amd.ops.fa4_rel_attention._inkling_rel_attention_kernel` with
+`AssertionError: Both operands must be same dtype. Got bf16 and uint8` at
+`tl.dot(q, k)`, during CUDA-graph-capture profiling at startup (not live traffic),
+aborting the whole engine. This is a 100%-deterministic Triton AST-compile failure
+given the shapes/dtypes involved, not a flaky or data-dependent crash.
+
+Context, as fresh (not yet GPU-validated) code-reading from this session to confirm or
+correct, not to trust blindly:
+
+{{known_context}}
+
+Environment: use the local docker image `{{image}}` (verify presence with `docker
+image inspect {{image}}`; do not pull if absent -- record as a blocker instead;
+confirm it still contains the crashing kernel source at
+`vllm/models/inkling/amd/ops/fa4_rel_attention.py` by reading the file inside the
+container, since it may have changed since this formula was authored). The original
+failing run instead pinned `{{failing_image_digest}}`, which was NOT present locally
+at authoring time -- re-check; use {{image}} if still absent, and note the
+discrepancy if {{image}}'s vllm commit differs materially from the failing run's.
+Resolve the vllm rig's source repository and tip-of-tree commit using `gc rig list
+--json` (registered path hint: {{vllm_repo_path}}; do not assume this hint is
+accurate without verifying it against the rig registration).
+
+{{gpu_rules}}
+
+Additional focus or hints: {{question}}
+
+Diagnose only; do not implement a fix in this step. If reproduction needs source
+changes (e.g. a minimal synthetic harness), use a worktree at
+`~/dev/cities/gc-worktrees/vllm/{{formula_id}}/investigate/<claimed-bead-id>` on branch
+`{{formula_id}}/investigate/<claimed-bead-id>`, per your pack's worktree protocol.
+Concretely:
+
+- Build the smallest faithful repro: either (a) a real `vllm serve` launch against
+  `{{model_path}}` with a flag-reduced version of {{failing_launch_command}} (confirm
+  the model path exists on whatever host/GPU you use; if it does not, do not
+  substitute an unrelated model -- fall back to (b)), or (b) a minimal synthetic
+  harness calling `inkling_fa4_rel_attention` directly with a `torch.uint8`-dtyped
+  paged KV cache and a `bf16` Q tensor of realistic shapes, mirroring
+  `tests/models/inkling/rocm/test_rel_attention.py`'s existing test structure (read it
+  in full first) but adding an fp8/uint8 KV cache case it does not currently cover
+  (confirm this gap by reading the whole file, not by assuming based on a grep).
+  Prefer (b) if (a) is blocked by missing weights or excessive runtime; state which you
+  used and why.
+- Confirm the crash reproduces on the current vllm tip-of-tree commit (file:line
+  references may have shifted since the captured log) before proposing a fix.
+- Determine exactly which code path(s) CUDA-graph-capture profiling exercises for this
+  model/TP/speculative-decoding configuration: does it reach ONLY
+  `_inkling_rel_attention_kernel` (the crashing one), or also
+  `_split_kv_stage1`/`inkling_rel_attention_split_kv_decode` (the sibling kernel that
+  already casts `k.to(q.dtype)`) for other captured shapes? Use `use_split_kv_decode`'s
+  and `use_gfx950_gluon_decode`/`use_gfx950_gluon_extend`'s actual gating conditions
+  (max_query_len, page_size, window_left, on_gfx950()) against the real captured
+  shapes, not assumptions.
+- Resolve the point-5 open question in {{known_context}}: is `InklingAttention.k_scale`/
+  `v_scale` (registered as constant 1.0, vllm/models/inkling/amd/attention.py:169-170)
+  genuinely read nowhere in the attention forward/kernel call path for BOTH the
+  split-KV and non-split-KV kernels (re-grep from scratch; the prior grep was scoped to
+  three specific files and may have missed an indirect call site elsewhere in the
+  model, e.g. in moe.py, mtp.py, or the quantization config loader)? Is there ANY
+  mechanism elsewhere (checkpoint config, `QuantizationConfig`, a calibration script)
+  that computes a non-unity scale for this model's fp8 KV cache that is silently
+  dropped by never reaching either kernel? If a real, non-unity scale IS computed
+  somewhere and dropped, that is a second, more severe finding to report distinctly
+  from the compile crash -- do not conflate the two.
+- Given the above, determine the correct fix shape for the crashing kernel: a bare
+  `k.to(q.dtype)` cast mirroring the sibling `_split_kv_stage1` kernel exactly (correct
+  IF scale is genuinely always unity/unused for this model), vs. a scale-aware dequant
+  (`(k.to(tl.float32) * k_scale).to(q.dtype)`-style, correct IF a real scale exists and
+  must be wired in) -- and if the latter, identify every additional call-site change
+  needed to actually thread a real `k_scale`/`v_scale` value into the kernel (both the
+  crashing kernel AND, if it has the same latent gap per point 5c, the sibling
+  split-KV kernel).
+- Check the `q.dtype` assumption itself: trace what `q_ptr`'s actual dtype is for
+  Inkling-FP8-dynamic specifically (e.g. does `--kv-cache-dtype=fp8` or any other flag
+  used in {{failing_launch_command}} affect Q's dtype, or is Q always the model's
+  bf16/fp16 compute dtype regardless of KV cache dtype)?
+- Determine whether `--kv-cache-dtype=fp8` is a recently-introduced flag for this
+  recipe (a regression) or a long-untested combination, if determinable from this
+  project's own git history (cron/nodes/*/logs, or cron/recipes if any trace of the
+  pre-move layout remains reachable via `git log --follow`).
+
+Use `{{artifact_dir}}` as the shared directory for this run. Write your artifacts
+under `{{artifact_dir}}/investigate/`, creating that subdirectory if needed; it must
+not contain an earlier run's reports. Do not overwrite existing files.
+
+Before closing this step, write `{{artifact_dir}}/investigate/investigation.md` with:
+- Your claimed bead ID, the vllm commit used, image used, and date.
+- The exact reproduction/tracing commands, container name/flags, GPU index,
+  environment variables, versions; mark missing information.
+- Fresh findings with file:line references and raw output paths. Separate fresh
+  observations from the supplied context and from untested hypotheses.
+- A definitive answer, with evidence, to: does the crash reproduce on current
+  tip-of-tree? Which code path(s) does CUDA-graph-capture profiling exercise for this
+  config? Is a real, nonunity k_scale/v_scale ever computed and silently dropped for
+  this model, or is unity genuinely correct? Which fix shape is right for the crashing
+  kernel -- bare dtype cast, or scale-aware dequant requiring additional wiring?
+- Ranked root-cause hypotheses with confidence, alternatives, and missing evidence.
+- A minimal experiment plan for the experimenter: hypothesis, prediction, control,
+  exact commands, distinguishing result.
+
+Append the handoff summary and absolute report path to this claimed step's notes with
+`gc bd update <claimed-bead-id> --append-notes <text>` and record
+`--set-metadata investigation.report_path=<path>`. Verify the report is readable, then
+set `gc.outcome=pass` on this claimed step and close only it.
+
+If blocked (image missing, no idle GPU, cannot produce a usable handoff), append the
+reason, set `gc.outcome=fail` and `gc.failure_reason=<reason>`, and close only this
+step. Do not close the workflow root.
+"""
+
+[steps.metadata]
+"gc.run_target" = "vllm/investigation.investigator"
+"gc.scope_ref" = "body"
+"gc.scope_role" = "member"
+"gc.on_fail" = "abort_scope"
+
+[[steps]]
+id = "experiment"
+title = """\
+Validate candidate fix shapes for the crashing kernel against a real GPU, confirming \
+numerical correctness (not just that compilation succeeds)"""
+needs = ["investigate"]
+description = """
+Read `{{artifact_dir}}/investigate/investigation.md` before running anything. Read the
+producer bead ID recorded in it, and verify it belongs to the same `gc.root_bead_id` as
+your claimed step and has `gc.outcome=pass`. Test environment: docker image
+`{{image}}`.
+
+{{gpu_rules}}
+
+Additional focus or hints: {{question}}
+
+Use a worktree at
+`~/dev/cities/gc-worktrees/vllm/{{formula_id}}/experiment/<claimed-bead-id>` on branch
+`{{formula_id}}/experiment/<claimed-bead-id>`, per your pack's worktree protocol.
+
+Test the handoff's hypotheses and candidate fix shape(s); do not assume its
+conclusions are correct, including which fix shape it recommended. Follow your
+six-step protocol for every experiment: hypothesis, prediction (recorded before
+running), exact command/environment, run, actual result, verdict (supports /
+contradicts / inconclusive).
+
+Depending on what the investigation determined about k_scale/v_scale:
+- If the investigation concluded a real, nonunity scale is genuinely never computed
+  for this model (unity is structurally correct), implement and test the bare
+  `k.to(q.dtype)` candidate (mirroring the sibling `_split_kv_stage1` kernel exactly)
+  in an isolated experiment worktree. Confirm it (a) compiles without the
+  AssertionError, (b) produces attention output numerically matching a pure-fp32
+  reference computed outside any kernel (construct this the way
+  `tests/models/inkling/rocm/test_rel_attention.py`'s existing `_reference` helper
+  does, extended to cover an fp8/uint8-dtyped K/V cache case), with rtol/atol you
+  justify given fp8's precision, and (c) matches the already-working
+  `_split_kv_stage1` kernel's output on an input small enough to exercise both
+  kernels with IDENTICAL underlying data (same positions/shapes small enough that
+  both `use_split_kv_decode` and the non-split path could plausibly run), to confirm
+  consistency between the two kernels, not just internal self-consistency of the one
+  you are fixing.
+- If the investigation concluded a real scale exists and must be wired in, implement
+  the scale-aware dequant candidate, test the same three criteria above, AND confirm
+  whether the sibling `_split_kv_stage1` kernel also needs the same scale wired in (if
+  it currently silently assumes unity too) -- do not fix only the crashing kernel if
+  the investigation found the same gap in both.
+- If the investigation's evidence is genuinely ambiguous between the two, test BOTH
+  candidates against the fp32 reference and report which wins, rather than guessing.
+
+Confirm whichever candidate wins does not regress
+`tests/models/inkling/rocm/test_rel_attention.py`,
+`tests/models/inkling/test_fa4_rel_attention.py`, and
+`tests/models/inkling/test_qkvr_prep.py` (read each file's current pass count fresh on
+the current commit before using it as your baseline; do not assume any specific prior
+count). If the investigation found CUDA-graph-capture profiling also reaches the
+sibling split-KV kernel for some shapes in this config, confirm the fix (or the
+decision not to touch it) is consistent across both.
+
+Save experiment records and raw output under `{{artifact_dir}}/experiment/` (creating
+it if needed) and write `{{artifact_dir}}/experiment/experiments.md` with the producer
+bead ID, every experiment's six steps, evidence paths, verdicts, uncertainties, and a
+recommended fix direction naming the source component, the function(s) to change, and
+the tested revision. Do not implement the production fix in the shared vllm checkout;
+candidate edits belong only in your own experiment worktree(s).
+
+Append the summary and absolute artifact paths to this claimed step's notes with
+`gc bd update <claimed-bead-id> --append-notes <text>`, set
+`experiment.report_path=<path>` and `gc.outcome=pass`, and close only this step. `pass`
+means the experiments were completed, even if a hypothesis is contradicted,
+inconclusive, or no fix is justified after all.
+
+If the handoff is missing, stale, or unusable, or runtime resources prevent execution,
+record the blocker, set `gc.outcome=fail` and `gc.failure_reason=<reason>`, and close
+only this step. Do not fabricate results or close earlier steps or the workflow root.
+"""
+
+[steps.metadata]
+"gc.run_target" = "vllm/experimentation.experimenter"
+"gc.scope_ref" = "body"
+"gc.scope_role" = "member"
+"gc.on_fail" = "abort_scope"
+
+[[steps]]
+id = "implement"
+title = """\
+Implement, validate, and commit a fix for the fp8-KV-cache Triton dtype-mismatch crash \
+in Inkling's ROCm relative-attention kernel"""
+needs = ["experiment"]
+description = """
+Read `{{artifact_dir}}/experiment/experiments.md`, the producer experiment bead, and
+the investigation artifacts it cites. Verify the investigation and experiment step
+beads belong to your `gc.root_bead_id`, completed with `gc.outcome=pass`, and recorded
+the report paths you are reading; record their IDs and paths on your claimed step.
+
+If the experiments concluded no fix is justified (e.g. the crash no longer reproduces
+on current tip-of-tree, or `--kv-cache-dtype=fp8` is simply unsupported-by-design for
+Inkling and should instead raise a clear, early, user-facing error rather than a
+confusing Triton stack trace -- consider recommending THIS as an alternative "fix" if
+the experiments found fp8 KV cache is not actually meant to be supported here yet),
+write the report documenting that conclusion and the evidence for it, set
+`gc.outcome=pass`, and close only your step -- do not proceed with the remaining
+implementation instructions below unless the experiments recommend a specific code
+fix.
+
+If the experiments did validate a fix, additional scope and resource constraints:
+{{constraints}}
+
+{{gpu_rules}}
+
+Choose the smallest coherent fix supported by the experiments' winning candidate.
+Explain why the fix preserves existing behavior for gfx950 (which never reaches this
+kernel per point 6 of the investigation's confirmed findings) and for non-fp8
+`kv_cache_dtype` configurations (`auto`/`bf16`/`fp16`, where `k`'s dtype already equals
+`q`'s dtype and a `.to(q.dtype)` cast, if that is the chosen fix, is a safe no-op). If
+the fix also touches the sibling `_split_kv_stage1` kernel (because the experiments
+found the same scale-handling gap there), explain that change's rationale separately.
+The owning repository is expected to be vllm (host checkout hint
+{{vllm_repo_path}}; resolve the authoritative path via `gc rig list --json`); verify
+against the evidence rather than assuming it. Optional base-ref override:
+{{base_ref}}. If empty, use the vllm rig's tip-of-tree default branch.
+
+Follow your worktree protocol. Record the shared vllm checkout's dirty state,
+branch/HEAD, and protected main/default-branch refs. Create/recover the linked
+worktree `~/dev/cities/gc-worktrees/vllm/{{formula_id}}/implement/<claimed-bead-id>`
+on branch `{{formula_id}}/implement/<claimed-bead-id>`, verifying repository, path,
+ownership, and branch before any edit. Save its absolute path as `work_dir` and
+`implementation.worktree_path`, and record `implementation.branch` and
+`implementation.base_commit`. All edits, builds, tests, staging, and commits happen
+there. Never modify the shared vllm checkout, never advance main, never edit the
+docker image.
+
+Implement the fix with focused regression coverage (at minimum, extend
+`tests/models/inkling/rocm/test_rel_attention.py` with an fp8/uint8 KV cache case that
+would have caught this compile failure, since that file's current coverage gap --
+confirm this gap fresh rather than trusting the investigation's claim of it -- is
+exactly why this crash shipped undetected). Validate inside `{{image}}`,
+bind-mounting your vllm worktree's python sources over the site-packages vllm
+directory (confirm the exact path for this image rather than assuming
+`/root/dev/vllm`) and confirming `vllm.__file__` points at them:
+1. The real-kernel repro (or script) the experiment step used to validate its winning
+   candidate, re-run against your committed fix, confirming (a) the Triton
+   CompilationError no longer occurs and (b) numerical output matches the fp32
+   reference within the experiment step's own justified tolerance.
+2. `tests/models/inkling/rocm/test_rel_attention.py`,
+   `tests/models/inkling/test_fa4_rel_attention.py`, and
+   `tests/models/inkling/test_qkvr_prep.py`, confirming no regression against the
+   experiment step's own measured baseline counts.
+3. If feasible given available hardware/weights, a real `vllm serve` launch against
+   {{model_path}} (or a dummy-weight equivalent if real weights are unavailable) with
+   `--kv-cache-dtype=fp8` reaching past CUDA-graph-capture profiling without crashing
+   -- this is the most direct validation that the original nightly failure is actually
+   resolved, not just that a kernel-level unit test passes.
+4. The repository's required lint/pre-commit hooks on changed files.
+Report which results are proxy-only (synthetic shapes, no real Inkling-FP8-dynamic
+weights, no end-to-end served-model accuracy comparison, no multi-node TP=8 run) and
+what remains untested.
+
+After validation passes, recheck the worktree and branch, stage only intended files by
+explicit path, inspect the staged diff, run `git diff --cached --check`, and commit on
+`{{formula_id}}/implement/<claimed-bead-id>` following the repo's commit/DCO/hook
+rules. Never bypass failing hooks. Record the full hash as
+`implementation.commit_hash`. Do not merge, push, or open a PR.
+
+Use `{{artifact_dir}}/implement/` for this run's artifacts (creating it if needed).
+Write `{{artifact_dir}}/implement/implementation.md` (source/producer IDs, fix and
+rationale, repository, worktree/branch/base/fix commits, validation commands and
+results, limitations, artifact paths) and export
+`{{artifact_dir}}/implement/implementation.patch` with `git diff --binary
+<base-commit> <fix-commit>`. Append the summary and paths to your claimed bead, set
+`implementation.report_path`, `implementation.patch_path`,
+`implementation.commit_hash`, and `gc.outcome=pass`, then close only your step.
+
+If no justified fix exists, required validation is unavailable, or committing fails,
+write a partial report with blockers, preserve worktree progress, set
+`gc.outcome=fail` and `gc.failure_reason`, and close only your step. Do not close
+earlier steps or the workflow root.
+"""
+
+[steps.metadata]
+"gc.run_target" = "vllm/implementation.implementer"
+"gc.scope_ref" = "body"
+"gc.scope_role" = "member"
+"gc.on_fail" = "abort_scope"
