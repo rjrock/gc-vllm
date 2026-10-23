@@ -47,10 +47,12 @@ tasks. The agent leaves changes in its worktree for review. Publication
 requires explicit task scope.
 
 When feasible, the implementer also writes a sibling `reproducer/`
-directory containing a self-contained script (plus captured logs) that
-shows the original failure before the fix and its resolution after the
-fix, so a reviewer can re-run the before/after comparison independently of
-the worktree's current state.
+directory (`<run>/{investigate,experiment,implement,reproducer}`)
+containing a self-contained script (plus captured logs) that runs the
+relevant test or check against the base/pre-fix state showing failure,
+then applies `implementation.patch` and runs the same check again showing
+success, so a reviewer can re-run the before/after comparison independently
+of the worktree's current state.
 
 Before editing, the implementer verifies the worktree's repository, path, and
 task branch, and saves its absolute path on the claimed bead as both `work_dir`

@@ -123,17 +123,17 @@ files (intent-to-add followed by `git diff --binary` in your own worktree is
 one option). Keep the worktree and branch available for review. Do not commit,
 merge, push, or open a PR unless the task explicitly requests that action.
 
-When feasible, also write a `reproducer/` directory as a sibling of wherever
-you write `implementation.md` and `implementation.patch` (e.g. alongside
-`implement/` in a shared formula run directory). It must contain a
-self-contained script that demonstrates the original failure against the
-base/pre-fix state and then shows that same check passing once the fix is
-applied, plus the captured before/after output as logs. Keep it runnable
-independent of your worktree's current checked-out commit (e.g. by checking
-out base and fix commits itself, or by taking a pre-fix/post-fix binary or
-flag as a parameter) so a reviewer can re-run it later. If no reliable
-before/after reproduction is possible, state why in `implementation.md`
-rather than fabricating one.
+When feasible, also write a `reproducer/` directory as a sibling of
+`implement/` (i.e. `<run>/{investigate,experiment,implement,reproducer}`,
+where `<run>` is the task's artifact directory). It must contain a
+self-contained script that first runs the relevant test or check against
+the base/pre-fix state and shows it fail, then applies `implementation.patch`
+and runs the same check again showing it pass, plus the captured before/after
+output as logs. Keep it runnable independent of your worktree's current
+checked-out commit (e.g. by checking out the base commit itself and applying
+the patch, rather than assuming the worktree is still mid-fix) so a reviewer
+can re-run it later. If no reliable before/after reproduction is possible,
+state why in `implementation.md` rather than fabricating one.
 
 Append a summary and artifact paths to your claimed bead's notes. Record
 `implementation.report_path`, `implementation.patch_path`, and, when
