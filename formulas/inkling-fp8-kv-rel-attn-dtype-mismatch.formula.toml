@@ -3,11 +3,13 @@ version = 1
 description = """\
 Investigate -> experiment -> implement a fix for a Triton compilation failure in \
 Inkling's ROCm relative-bias paged-attention kernel when `--kv-cache-dtype=fp8` is \
-used. A nightly serving run of Inkling-FP8-dynamic on an MI300X (gfx942) node, \
-launched with `--kv-cache-dtype=fp8 --enable-expert-parallel \
+used. A nightly serving run of Inkling-FP8-dynamic on node f22, an MI350X (gfx950) \
+node, launched with `--kv-cache-dtype=fp8 --enable-expert-parallel \
 --speculative-config={"method":"mtp","num_speculative_tokens":8}` against \
 `vllm/vllm-openai-rocm:nightly`, crashed every TP worker during engine startup \
-(CUDA-graph-capture profiling, not real traffic) with \
+(CUDA-graph-capture profiling, not real traffic), recurring verbatim on 2026-10-23 \
+(cron/nodes/f22/logs/inkling-fp8-dynamic/2026-10-23/nightly/server.log) after an \
+earlier 2026-10-21 occurrence, with \
 `triton.compiler.errors.CompilationError: ... AssertionError: Both operands must be \
 same dtype. Got bf16 and uint8` at `_inkling_rel_attention_kernel`'s \
 `scores = tl.dot(q, k) * (softmax_scale * log2e)` line \
@@ -48,27 +50,45 @@ Run identifier used to label this run's worktree directories and branches \
 default = "inkling-fp8-kv-rel-attn-dtype-mismatch"
 pattern = "^[A-Za-z0-9_.-]+$"
 
+[vars.node]
+description = """\
+Node to run repro/validation containers and `vllm serve` commands on, reached via \
+plain `ssh {{node}} ...` (key-based, no interactive auth). Defaults to f22, the node \
+the original and recurring nightly crash was observed on. Specify a different node \
+(e.g. c13) to run this workflow's serve/repro commands there instead -- this bug is \
+confirmed (live, 2026-10-23) to reproduce on gfx950/MI350X hardware, so whichever \
+node is set here MUST be gfx950, either an MI350X or MI355X part -- confirm with \
+`ssh {{node}} rocm-smi --showproductname` before trusting any result from it; do not \
+assume architecture without checking. Do not use a gfx942/MI300X node: that \
+architecture is untested for this specific recurrence and is not a substitute -- there \
+is no fallback host for this workflow; if every GPU on `{{node}}` is busy, record that \
+as a blocker rather than switching to a different-architecture machine (see point 6 of \
+{{known_context}})."""
+default = "f22"
+
 [vars.image]
 description = """\
-Local docker image to reproduce and validate in. Verify it is present locally with \
-`docker image inspect {{image}}` before using it; do not pull. Confirmed present and \
+Docker image to reproduce and validate in, on `{{node}}`. Verify it is present there \
+with `ssh {{node}} docker image inspect {{image}}` before using it; do not pull \
+(transfer from elsewhere per {{gpu_rules}} if absent). Confirmed present and \
 confirmed (this session) to contain the exact buggy kernel source at \
 `/usr/local/lib/python3.12/dist-packages/vllm/models/inkling/amd/ops/fa4_rel_attention.py` \
 (vllm.__version__ 0.32.0rc1.dev100+g77154ca61). The failing nightly run instead pinned \
 `vllm/vllm-openai-rocm@sha256:fdd4e1041ad3f3a9c5bf61f291f934405d7b22bcb841c380dc72235411f4f0c0`, \
-which is NOT present locally (`docker image inspect` on that digest fails) -- re-verify \
-both facts against the live rig before relying on either; if the two images disagree on \
-vllm commit, note the discrepancy rather than silently treating them as equivalent."""
+which is NOT present on `{{node}}` (`docker image inspect` on that digest fails) -- \
+re-verify both facts against the live rig before relying on either; if the two images \
+disagree on vllm commit, note the discrepancy rather than silently treating them as \
+equivalent."""
 default = "vllm/vllm-openai-rocm:nightly"
 
 [vars.failing_image_digest]
 description = """\
-The exact image digest the original failing nightly run used (NOT present locally at \
-formula-authoring time -- `docker image inspect` on it fails). Recorded for traceability \
-only; do not attempt to pull it (city policy prefers local images). If the fix needs \
-validating against this exact digest and it genuinely cannot be obtained locally, record \
-that as a noted limitation rather than a blocker, since {{image}} already contains the \
-same buggy kernel source confirmed this session."""
+The exact image digest the original failing nightly run used (NOT present on `{{node}}` \
+at formula-authoring time -- `docker image inspect` on it fails there). Recorded for \
+traceability only; do not attempt to pull it (city policy prefers local/transferred \
+images). If the fix needs validating against this exact digest and it genuinely cannot \
+be obtained, record that as a noted limitation rather than a blocker, since {{image}} \
+already contains the same buggy kernel source confirmed this session."""
 default = "vllm/vllm-openai-rocm@sha256:fdd4e1041ad3f3a9c5bf61f291f934405d7b22bcb841c380dc72235411f4f0c0"
 
 [vars.vllm_repo_path]
@@ -87,7 +107,8 @@ default = ""
 [vars.failing_launch_command]
 description = """\
 The vLLM serve invocation that produced the original crash (from \
-cron/nodes/f22/logs/inkling-fp8-dynamic/2026-10-21/nightly/server.log on node f22), \
+cron/nodes/f22/logs/inkling-fp8-dynamic/2026-10-21/nightly/server.log, originally \
+captured on node f22 -- run it on `{{node}}` instead if {{node}} differs from f22), \
 recorded verbatim for building the smallest faithful repro. Re-derive the actually \
 load-bearing flags (the investigation should confirm, e.g. by flag-by-flag ablation, \
 which of these are necessary to reproduce vs. incidental) rather than assuming every \
@@ -100,10 +121,11 @@ default = '''vllm serve /data/models/Inkling-FP8-dynamic --host=0.0.0.0 --port=9
 
 [vars.model_path]
 description = """\
-Model weights path used by the failing nightly run. NOT present on this host at \
-formula-authoring time (`/data/models/Inkling-FP8-dynamic` does not exist here -- \
-re-verify; it may be host-specific, present only on node f22). If absent on whichever \
-host/GPU you end up using, do not substitute an unrelated model: either find the actual \
+Model weights path used by the failing nightly run. NOT confirmed present on `{{node}}` \
+at formula-authoring time if `{{node}}` differs from f22 (`/data/models/Inkling-FP8-dynamic` \
+was only confirmed on node f22 -- re-verify on whichever node is actually set here). If \
+absent on whichever host/GPU you end up using, do not substitute an unrelated model: \
+either find the actual \
 weights (check other registered model hosts / mounts) or build a minimal dummy-weight \
 Inkling config for kernel-level repro instead (the crash is a compile-time Triton dtype \
 assertion in a kernel reachable from a unit test or tiny synthetic harness -- it does not \
@@ -214,13 +236,37 @@ a raw `.to(q.dtype)`)? Evidence both ways:
       never reads them -- if so, that is itself a separate, likely more severe silent
       correctness bug: scales computed but silently dropped).
 
-6. gfx950/MI350 is NOT affected by this exact code path: `use_gfx950_gluon_decode`/
+6. CORRECTED (fresh evidence, 2026-10-23): an earlier draft of this context claimed
+gfx950/MI350 is NOT affected because `use_gfx950_gluon_decode`/
 `use_gfx950_gluon_extend` (fa4_rel_attention.py:31-61) route gfx950 through entirely
 different vendored Gluon kernels before ever reaching `_inkling_rel_attention_kernel`.
-This crash's generic (non-gfx950) Triton kernel is reached only on gfx942/MI300X (or
-any ROCm arch where neither gfx950 gate matches) -- confirm this guard is actually
-reached (i.e. `on_gfx950()` returns False) on whichever GPU you validate against,
-rather than assuming it.
+This is WRONG: the crash recurred verbatim on node f22, which is confirmed 100%
+gfx950/MI350X (`ssh f22 rocm-smi --showproductname`), on 2026-10-23
+(cron/nodes/f22/logs/inkling-fp8-dynamic/2026-10-23/nightly/server.log), with the
+identical `Both operands must be same dtype. Got bf16 and uint8` error at the same
+`fa4_rel_attention.py:104`-ish `tl.dot(q, k)` site. Reading the two gfx950 gates
+side-by-side explains why: `use_gfx950_gluon_decode` requires `max_query_len == 1`,
+and `use_gfx950_gluon_extend` requires `max_query_len > 1` AND `max_kv_len >= 8192`
+AND `window_left < 0`. There is a GAP between them: any call with
+`max_query_len > 1` (e.g. produced by this recipe's MTP speculative decoding,
+`num_speculative_tokens=8`) and `max_kv_len < 8192` (true at CUDA-graph-capture
+startup profiling, and plausibly in some live-traffic shapes too) satisfies NEITHER
+gate and falls through to the same unguarded generic `_inkling_rel_attention_kernel`
+that gfx942 would also hit. So this bug reproduces on gfx950 (confirmed) via this
+gate-gap, not via gfx950 being universally unaffected. A prior investigation session
+(bead vl-mza6/vl-df9x, report at
+`/home/ryrock/dev/cities/runs/inkling-c13/investigate/investigation.md`) validated a
+two-part fix (a `.view(fp8_dtype)` reinterpret-cast at the `InklingAttention` call
+site plus a `.to(q.dtype)` cast inside the kernel) ONLY on a gfx942/MI300X host
+(s79), never on gfx950 -- re-validate that fix (or find a different one) on actual
+gfx950 hardware per {{node}}, since the Gluon-kernel gating difference may mean
+gfx950 needs additional or different handling (e.g. does the gate-gap shape also
+flow through the gfx950 Gluon kernels' own fp8 handling in some configurations,
+and do the Gluon kernels accept but silently ignore `k_scale`/`v_scale` the same
+way, per the investigation's open question about `gluon_rel_mha_decode_gfx950`/
+`gluon_rel_mha_extend_gfx950`). Confirm precisely which gate (or gap) is reached
+for each captured shape, do not assume it is the same analysis as the gfx942 case
+without checking on gfx950 hardware directly.
 
 7. Not yet established, and explicitly left to the investigation: (a) is `k_scale`/
 `v_scale` genuinely unused/dead weight for this model class, or is there an AMD-side
@@ -235,60 +281,46 @@ cron/recipes, if still present after the recent `cron/recipes -> cron/nodes` mov
 when `--kv-cache-dtype=fp8` was introduced for Inkling-FP8-dynamic, if at all
 determinable from history.'''
 
-[vars.fallback_host]
-description = """\
-SSH alias for a same-architecture fallback host to use when every local GPU is occupied. \
-Must be reachable via plain `ssh {{fallback_host}} ...` (key-based, no interactive auth)."""
-default = "s79"
-
 [vars.gpu_rules]
-description = "Rules for using the local GPUs safely, with same-arch remote failover."
-default = '''GPU RULES (local host has 8 MI300X GPUs, shared with other users).
-1. Use ONE GPU per container. Before every launch run `rocm-smi --showuse` and
-   `rocm-smi --showmeminfo vram`; pick a GPU with 0% use and ~no VRAM held.
-   Never use a busy GPU. Record the index (and host) in your report. Note: this
-   bug is a hard Triton COMPILE-time failure reachable with a single GPU and a
-   tiny synthetic input -- you do not need all 8 GPUs or true TP=8 to reproduce
-   it; only use more than one GPU if a single-GPU repro genuinely cannot reach
-   the crashing code path (e.g. if the kernel is only ever invoked under
-   enable_expert_parallel + TP>1 scheduling, confirm this before assuming it).
-2. Run containers with `--device=/dev/kfd --device=/dev/dri --group-add video
-   --security-opt seccomp=unconfined --ipc=host --shm-size=16g` and
-   `-e HIP_VISIBLE_DEVICES=<idx>`, name them with your claimed bead ID, use
-   `--entrypoint bash` (the image entrypoint is not a shell), and `docker rm -f`
-   them when done, on every error path.
+description = "Rules for using {{node}}'s GPUs safely. No fallback host -- {{node}} is required."
+default = '''GPU RULES (resolve <NODE> and <IMAGE> below to the concrete NODE/IMAGE
+values stated directly above where this block is included -- do not treat these
+angle-bracket names as literal hostnames/images. <NODE> is expected to have 8 gfx950
+(MI350X or MI355X) GPUs, shared with other users -- re-verify this count/architecture
+on <NODE> itself rather than assuming it).
+1. Confirm `<NODE>` is reachable (`ssh <NODE> true`) and is gfx950 (MI350X or
+   MI355X) (`ssh <NODE> rocm-smi --showproductname`) before using it. This bug is
+   REQUIRED to be reproduced and validated on gfx950 hardware -- it is confirmed
+   (live nightly recurrence, 2026-10-23) to reproduce there; do not substitute a
+   gfx942/MI300X node even temporarily, and there is no fallback host for this
+   workflow. If `<NODE>` is unreachable or not gfx950, record that as a blocker
+   rather than switching architecture. Use ONE GPU per container. Before every
+   launch run `ssh <NODE> rocm-smi --showuse` and `ssh <NODE> rocm-smi
+   --showmeminfo vram`; pick a GPU with 0% use and ~no VRAM held. Never use a busy
+   GPU. Record the index (and node) in your report. If every GPU on `<NODE>` is
+   busy, record that as a blocker rather than waiting or using a busy GPU.
+   Note: this bug is a hard Triton COMPILE-time failure reachable with a single
+   GPU and a tiny synthetic input -- you do not need all 8 GPUs or true TP=8 to
+   reproduce it; only use more than one GPU if a single-GPU repro genuinely
+   cannot reach the crashing code path (e.g. if the kernel is only ever invoked
+   under enable_expert_parallel + TP>1 scheduling, confirm this before assuming
+   it).
+2. Run containers (via `ssh <NODE> docker ...`) with `--device=/dev/kfd
+   --device=/dev/dri --group-add video --security-opt seccomp=unconfined
+   --ipc=host --shm-size=16g` and `-e HIP_VISIBLE_DEVICES=<idx>`, name them with
+   your claimed bead ID, use `--entrypoint bash` (the image entrypoint is not a
+   shell), and `docker rm -f` them when done, on every error path (including via
+   `ssh <NODE> docker rm -f ...`).
 3. Triton JIT-compiles kernels on first use and can take minutes; allow for it.
-4. Do not modify the image. Do not run `docker commit` over `{{image}}`. When
+4. Do not modify the image. Do not run `docker commit` over `<IMAGE>`. When
    validating a vllm-side fix, bind-mount your vllm worktree's python sources
-   read-only over /root/dev/vllm (or wherever `vllm.__file__` resolves inside
-   the image -- confirm the actual site-packages path first) inside the
-   container, and confirm `vllm.__file__` points at your mounted sources
-   before trusting any test result.
-5. Disk: `/`, `/tmp`, `/root` share one overlay filesystem on this host (about
-   3.5T total; check `df -h` before large builds).
-
-FALLBACK HOST (use only if step 1 finds every local GPU busy):
-6. `{{fallback_host}}` is a second host with the same GPU architecture
-   (gfx942/MI300X) as local, reachable via `ssh {{fallback_host}} <cmd>`. Before
-   falling back, confirm it is actually needed: a transient busy reading is not
-   enough -- recheck local `rocm-smi --showuse` once more first.
-7. Confirm reachability with `ssh {{fallback_host}} true`. Then pick an idle GPU
-   there the same way as rule 1, but via `ssh {{fallback_host}} rocm-smi
-   --showuse` / `--showmeminfo vram`. If every GPU on both hosts is busy, record
-   that as a blocker rather than waiting or using a busy GPU anywhere.
-8. Check whether `{{image}}` is already present on `{{fallback_host}}` with
-   `ssh {{fallback_host}} docker image inspect {{image}}`. Only if absent,
-   transfer it once via `docker save {{image}} | ssh {{fallback_host}} docker
-   load` (never via a registry push/pull). Do not repeat the transfer if a later
-   check finds the image already present.
-9. Place your worktree/scratch dir on `{{fallback_host}}` under your home
-   directory there (e.g. `~/gc-scratch/<claimed-bead-id>/`), synced from the
-   local copy with `rsync -a --delete`; re-run that rsync after each local edit
-   instead of editing the remote copy directly. Run every docker command for
-   that work via `ssh {{fallback_host}} docker ...` (same flags as rule 2),
-   substituting the remote worktree path for local bind-mounts.
-10. Note in your report which host and GPU index you actually used, and why
-    (local busy, remote chosen) if you fell back.'''
+   (synced to `<NODE>`, e.g. via `rsync -a --delete`) read-only over
+   /root/dev/vllm (or wherever `vllm.__file__` resolves inside the image --
+   confirm the actual site-packages path first) inside the container, and
+   confirm `vllm.__file__` points at your mounted sources before trusting any
+   test result.
+5. Disk: check `df -h` on `<NODE>` before large builds; layout/capacity may
+   differ from any other host.'''
 
 [[steps]]
 id = "body"
@@ -309,9 +341,13 @@ Reproduce the Triton compile-time dtype-mismatch crash and determine the correct
 scale-aware or scale-free fix shape for the K operand"""
 needs = []
 description = """
-Re-verify, from scratch, the crash a nightly serving run hit on node f22
-(cron/nodes/f22/logs/inkling-fp8-dynamic/2026-10-21/nightly/server.log): every TP
-worker failed Triton compilation of
+Re-verify, from scratch, the crash a nightly serving run hit on node f22 (gfx950/
+MI350X), first on 2026-10-21 and recurring verbatim on 2026-10-23
+(cron/nodes/f22/logs/inkling-fp8-dynamic/2026-10-23/nightly/server.log) -- reproduce
+and validate on `{{node}}`, which MUST be gfx950 (MI350X or MI355X; confirm per
+{{gpu_rules}} before trusting any result -- this bug is confirmed to reproduce on
+gfx950 hardware, do not substitute a gfx942/MI300X node): every TP worker failed
+Triton compilation of
 `vllm.models.inkling.amd.ops.fa4_rel_attention._inkling_rel_attention_kernel` with
 `AssertionError: Both operands must be same dtype. Got bf16 and uint8` at
 `tl.dot(q, k)`, during CUDA-graph-capture profiling at startup (not live traffic),
@@ -323,17 +359,21 @@ correct, not to trust blindly:
 
 {{known_context}}
 
-Environment: use the local docker image `{{image}}` (verify presence with `docker
-image inspect {{image}}`; do not pull if absent -- record as a blocker instead;
-confirm it still contains the crashing kernel source at
+Environment: run all repro/validation commands on `{{node}}` (via `ssh {{node}}
+...`), using docker image `{{image}}` there (verify presence with `ssh {{node}}
+docker image inspect {{image}}`; do not pull if absent -- record as a blocker
+instead; confirm it still contains the crashing kernel source at
 `vllm/models/inkling/amd/ops/fa4_rel_attention.py` by reading the file inside the
 container, since it may have changed since this formula was authored). The original
-failing run instead pinned `{{failing_image_digest}}`, which was NOT present locally
-at authoring time -- re-check; use {{image}} if still absent, and note the
+failing run instead pinned `{{failing_image_digest}}`, which was NOT present on
+`{{node}}` at authoring time -- re-check; use {{image}} if still absent, and note the
 discrepancy if {{image}}'s vllm commit differs materially from the failing run's.
 Resolve the vllm rig's source repository and tip-of-tree commit using `gc rig list
 --json` (registered path hint: {{vllm_repo_path}}; do not assume this hint is
 accurate without verifying it against the rig registration).
+
+NODE={{node}} IMAGE={{image}} -- resolve every `<NODE>`/`<IMAGE>` placeholder in the
+rules below to these values.
 
 {{gpu_rules}}
 
@@ -439,7 +479,10 @@ description = """
 Read `{{artifact_dir}}/investigate/investigation.md` before running anything. Read the
 producer bead ID recorded in it, and verify it belongs to the same `gc.root_bead_id` as
 your claimed step and has `gc.outcome=pass`. Test environment: docker image
-`{{image}}`.
+`{{image}}` on `{{node}}`.
+
+NODE={{node}} IMAGE={{image}} -- resolve every `<NODE>`/`<IMAGE>` placeholder in the
+rules below to these values.
 
 {{gpu_rules}}
 
@@ -536,6 +579,9 @@ fix.
 If the experiments did validate a fix, additional scope and resource constraints:
 {{constraints}}
 
+NODE={{node}} IMAGE={{image}} -- resolve every `<NODE>`/`<IMAGE>` placeholder in the
+rules below to these values.
+
 {{gpu_rules}}
 
 Choose the smallest coherent fix supported by the experiments' winning candidate.
@@ -564,8 +610,9 @@ Implement the fix with focused regression coverage (at minimum, extend
 `tests/models/inkling/rocm/test_rel_attention.py` with an fp8/uint8 KV cache case that
 would have caught this compile failure, since that file's current coverage gap --
 confirm this gap fresh rather than trusting the investigation's claim of it -- is
-exactly why this crash shipped undetected). Validate inside `{{image}}`,
-bind-mounting your vllm worktree's python sources over the site-packages vllm
+exactly why this crash shipped undetected). Validate on `{{node}}` inside `{{image}}`
+(sync your vllm worktree's sources to `{{node}}`, e.g. via `rsync -a --delete`, per
+{{gpu_rules}}), bind-mounting those python sources over the site-packages vllm
 directory (confirm the exact path for this image rather than assuming
 `/root/dev/vllm`) and confirming `vllm.__file__` points at them:
 1. The real-kernel repro (or script) the experiment step used to validate its winning

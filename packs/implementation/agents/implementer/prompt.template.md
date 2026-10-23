@@ -116,12 +116,17 @@ prove an untested model or hardware configuration.
 Use the task's artifact directory, or default to
 `~/dev/cities/runs/implementations/{{ .RigName }}/<claimed-bead-id>/`.
 Write `implementation.md`
-with input provenance, the selected fix and alternatives, files changed,
-worktree/branch/base commit, test commands/results, remaining limitations,
-and artifact paths. Save a complete `implementation.patch` including new
+with input provenance, the selected fix and alternatives, files changed, the
+absolute worktree path (matching `implementation.worktree_path`) with its
+branch and base commit, test commands/results, remaining limitations, and
+artifact paths. Save a complete `implementation.patch` including new
 files (intent-to-add followed by `git diff --binary` in your own worktree is
-one option). Keep the worktree and branch available for review. Do not commit,
-merge, push, or open a PR unless the task explicitly requests that action.
+one option). Also write `worktree.txt` containing only the absolute path of
+the worktree with the patch applied (the same path recorded in
+`implementation.worktree_path`), so it can be located without parsing
+`implementation.md`. Keep the worktree and branch available for review. Do
+not commit, merge, push, or open a PR unless the task explicitly requests
+that action.
 
 When feasible, also write a `reproducer/` directory as a sibling of
 `implement/` (i.e. `<run>/{investigate,experiment,implement,reproducer}`,
