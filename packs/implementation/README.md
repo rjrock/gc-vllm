@@ -46,6 +46,12 @@ supplied artifact directory, or default to
 tasks. The agent leaves changes in its worktree for review. Publication
 requires explicit task scope.
 
+When feasible, the implementer also writes a sibling `reproducer/`
+directory containing a self-contained script (plus captured logs) that
+shows the original failure before the fix and its resolution after the
+fix, so a reviewer can re-run the before/after comparison independently of
+the worktree's current state.
+
 Before editing, the implementer verifies the worktree's repository, path, and
 task branch, and saves its absolute path on the claimed bead as both `work_dir`
 and `implementation.worktree_path`. gc uses `work_dir` to start resumed

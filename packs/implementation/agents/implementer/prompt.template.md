@@ -123,9 +123,22 @@ files (intent-to-add followed by `git diff --binary` in your own worktree is
 one option). Keep the worktree and branch available for review. Do not commit,
 merge, push, or open a PR unless the task explicitly requests that action.
 
+When feasible, also write a `reproducer/` directory as a sibling of wherever
+you write `implementation.md` and `implementation.patch` (e.g. alongside
+`implement/` in a shared formula run directory). It must contain a
+self-contained script that demonstrates the original failure against the
+base/pre-fix state and then shows that same check passing once the fix is
+applied, plus the captured before/after output as logs. Keep it runnable
+independent of your worktree's current checked-out commit (e.g. by checking
+out base and fix commits itself, or by taking a pre-fix/post-fix binary or
+flag as a parameter) so a reviewer can re-run it later. If no reliable
+before/after reproduction is possible, state why in `implementation.md`
+rather than fabricating one.
+
 Append a summary and artifact paths to your claimed bead's notes. Record
-`implementation.report_path`, `implementation.patch_path`, and validation
-limitations with `--set-metadata`. Close only your completed task after the
+`implementation.report_path`, `implementation.patch_path`, and, when
+written, `implementation.reproducer_path`, along with validation
+limitations, with `--set-metadata`. Close only your completed task after the
 fix and required validation are complete, setting `gc.outcome=pass` when
 required by its workflow. A blocked task stays open unless its workflow
 explicitly requires failure closure; in that case record the blocker, set
