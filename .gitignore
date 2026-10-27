@@ -1,6 +1,11 @@
 # Gas City
 .gc/
+.agents/skills/
+.claude/skills/
 .beads/*
+.cache/
+.config/
+.dolt-backup/
 !.beads/identity.toml
 hooks/
 
