@@ -1,0 +1,4 @@
+[pack]
+name = "pull-request"
+schema = 2
+description = "Drafts vLLM pull-request descriptions from investigate/experiment/implement artifacts"

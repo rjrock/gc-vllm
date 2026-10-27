@@ -6,6 +6,7 @@ provider = "claude"
 base = "builtin:claude"
 args_append = ["--permission-mode=bypassPermissions"]
 ready_delay_ms = 0
+
 [providers.codex]
 base = "builtin:codex"
 args_append = ["--dangerously-bypass-hook-trust"]
@@ -21,24 +22,37 @@ version = "sha:3b3b89f2011e06d84459aa7bea1552382f13930a"
 [[rigs]]
 name = "vllm"
 default_branch = "main"
+
 [rigs.imports]
 [rigs.imports.experimentation]
 source = "./packs/experimentation"
+
 [rigs.imports.gc]
 source = "https://github.com/gastownhall/gascity-packs/tree/main/gascity/roles"
 version = "sha:3b3b89f2011e06d84459aa7bea1552382f13930a"
+
 [rigs.imports.implementation]
 source = "./packs/implementation"
+
 [rigs.imports.investigation]
 source = "./packs/investigation"
+
+[rigs.imports.pull-request]
+source = "./packs/pull-request"
 
 [[rigs]]
 name = "aiter"
 default_branch = "main"
+
 [rigs.imports]
 [rigs.imports.experimentation]
 source = "./packs/experimentation"
+
 [rigs.imports.implementation]
 source = "./packs/implementation"
+
 [rigs.imports.investigation]
 source = "./packs/investigation"
+
+[rigs.imports.pull-request]
+source = "./packs/pull-request"
