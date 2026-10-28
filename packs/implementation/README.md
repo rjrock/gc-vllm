@@ -39,9 +39,12 @@ in its description, then dispatch it with
 `gc sling <rig>/implementation.implementer <bead-id> --no-formula`.
 
 Worktrees default to
-`~/dev/cities/gc-worktrees/<rig>/<implementation-step-bead-id>/` on branch
-`implement/<implementation-step-bead-id>`. Reports and patches use the
-supplied artifact directory, or default to
+`~/dev/cities/gc-worktrees/<rig>/<implementation-step-bead-id>/` on a branch
+named `<descriptive-slug>`, where `<descriptive-slug>` summarizes the chosen
+fix (e.g. `fix-topk-sigmoid-renormalize`) rather than the bead ID; the exact
+name is recorded as `implementation.branch` on the bead, since it cannot be
+reconstructed from the bead ID alone. Reports and
+patches use the supplied artifact directory, or default to
 `~/dev/cities/runs/implementations/<rig>/<bead-id>/` for direct
 tasks. The agent leaves changes in its worktree for review. Publication
 requires explicit task scope.

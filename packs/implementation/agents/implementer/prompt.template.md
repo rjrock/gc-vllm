@@ -50,14 +50,19 @@ start in a task worktree; do not treat that working directory as the shared
 source repository. Read the applicable `AGENTS.md` files and record the
 source commit and existing dirty state without changing the shared checkout.
 
-Read `work_dir` and `implementation.worktree_path` from your claimed bead.
-When either is present, recover that worktree before creating another; if
-both are present, they must identify the same absolute path. Never infer
-task ownership from the current working directory alone.
+Read `work_dir`, `implementation.worktree_path`, and `implementation.branch`
+from your claimed bead. When any is present, recover that worktree and
+branch before creating another; if both path fields are present, they must
+identify the same absolute path. Never infer task ownership from the
+current working directory alone.
 
 Use the task's `base_ref`, or the registered rig's default branch when absent.
 Resolve it to a commit and record how it compares with the experiment's tested
-commit. Create a new branch `implement/<claimed-bead-id>` and a git worktree at
+commit. Choose a short, descriptive, kebab-case branch name summarizing the
+fix being implemented (e.g. `fix-topk-sigmoid-renormalize`), derived from the
+claimed bead's title or the chosen fix — never the bare bead ID, which
+identifies the task but says nothing about the change, and no prefix like
+`implement/`. Create that branch and a git worktree at
 `~/dev/cities/gc-worktrees/{{ .RigName }}/<claimed-bead-id>` using:
 
 ```bash
@@ -68,27 +73,32 @@ Create the parent directory as needed. Before editing or reusing a worktree,
 verify with Git that its top-level directory is the intended absolute path,
 its common Git directory matches the registered {{ .RigName }} repository
 (`{{ .RigRoot }}`), it is a linked worktree (its Git directory differs from
-the common Git directory), and its branch is `implement/<claimed-bead-id>`.
-Reuse it only when its path, branch, and recorded task ownership match this
-bead; preserve its progress. If any check fails or a branch or path belongs
-to other work, record the conflict. Never force-overwrite it or stash,
-reset, clean, or switch the shared checkout. Existing uncommitted source
-changes do not transfer into a new worktree; review any relevant experiment
-patch and deliberately port the needed changes.
+the common Git directory), and its branch matches the `implementation.branch`
+already recorded on this bead (read that back rather than reconstructing the
+name, since it is a descriptive slug chosen per task, not derived from the
+bead ID). Reuse it only when its path, branch, and recorded task ownership
+match this bead; preserve its progress. If any check fails or a branch or
+path belongs to other work, record the conflict. Never force-overwrite it or
+stash, reset, clean, or switch the shared checkout. Existing uncommitted
+source changes do not transfer into a new worktree; review any relevant
+experiment patch and deliberately port the needed changes.
 
 Before any source edit, dependency setup, or test, record the absolute path
-as both `work_dir` and `implementation.worktree_path` on your claimed bead:
+as both `work_dir` and `implementation.worktree_path`, and the chosen branch
+name as `implementation.branch`, on your claimed bead:
 
 ```bash
 gc bd --rig {{ .RigName }} update <bead-id> \
   --set-metadata work_dir=<absolute-worktree-path> \
-  --set-metadata implementation.worktree_path=<absolute-worktree-path>
+  --set-metadata implementation.worktree_path=<absolute-worktree-path> \
+  --set-metadata implementation.branch=<branch-name>
 ```
 
 `work_dir` is gc's worktree recovery metadata: the orchestrator uses it to
-start a resumed session in this worktree. Read the bead back and verify both
-paths were saved. Also record `implementation.branch` and
-`implementation.base_commit` with `--set-metadata`.
+start a resumed session in this worktree. Read the bead back and verify all
+three values were saved, since `implementation.branch` is now the only
+record of the chosen branch name — it cannot be reconstructed from the bead
+ID. Also record `implementation.base_commit` with `--set-metadata`.
 Use this worktree as the working directory for every edit, dependency setup,
 and test command. Before each such command, verify its working directory is
 the recorded worktree; stop if it points at the shared checkout or another
