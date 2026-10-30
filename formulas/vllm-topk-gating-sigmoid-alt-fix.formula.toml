@@ -1,0 +1,460 @@
+formula = "vllm-topk-gating-sigmoid-alt-fix"
+version = 1
+description = """\
+Investigate -> experiment -> implement an evaluation of an ALTERNATIVE fix direction for \
+aiter's `topk_sigmoid` renormalize=True bug, scoped entirely to the vllm rig: instead of \
+patching aiter's `topk_sigmoid` op (the fix pursued by the sibling formula \
+aiter-topk-sigmoid-renormalize-fix.formula.toml), this workflow tests the hypothesis that \
+vLLM's own dispatch can route sigmoid-scored MoE top-k through aiter's separate, already-\
+correct `topk_gating` kernel (aiter/ops/topk.py, score_func support) instead of ever calling \
+`topk_sigmoid` at all -- the same kernel vLLM already uses for softmax scoring on \
+gfx942/gfx950 via rocm_aiter_ops.topk_gating / is_topk_gating_enabled(). No aiter-side change \
+would be required under this hypothesis; do not modify the aiter checkout or rig in this \
+workflow -- if the experiments conclude an aiter-side change is also needed, record that as a \
+finding and recommend a follow-up, do not implement it here."""
+
+[requires]
+formula_compiler = ">=2.0.0"
+
+[vars.artifact_dir]
+description = "Absolute, shared artifact directory, unique to this workflow run."
+required = true
+pattern = "^/"
+
+[vars.formula_id]
+description = """\
+Run identifier used to label this run's worktree directories and branches \
+(vllm/{{formula_id}}/<step>/<bead-id>). Defaults to this formula's name."""
+default = "vllm-topk-gating-sigmoid-alt-fix"
+pattern = "^[A-Za-z0-9_.-]+$"
+
+[vars.image]
+description = """\
+Local docker image to reproduce and validate in. Already present locally (no pull \
+needed): image ID a6a7a3a8e67b, 49.3GB. Contains an editable vllm at /root/dev/vllm (git \
+HEAD b689feb9f22129cb9ba65ea72e3e67e4a9c95355) and an ALREADY-EDITABLE amd-aiter install \
+at /root/dev/aiter (git HEAD a29547a2f8a986c90b9173fcf13769f6b3cf0502, remote \
+rjrock/aiter). Build toolchain present: hipcc (HIP 7.15.26333), ninja, gcc 11.4.0, git, \
+pybind11 3.0.4, torch 2.13.0+rocm10.0.0. Verify it is still present locally with `docker \
+image inspect {{image}}` before using it; do not pull. A newer `rjrock2/vllm-ci-ext:oct23` \
+image may also exist locally -- confirm with `docker images` and note if you choose to use \
+it instead, since this workflow has only been informally sanity-checked (not formally \
+validated by this workflow's own steps) against oct22."""
+default = "rjrock2/vllm-ci-ext:oct22"
+
+[vars.repo_path]
+description = """\
+Host vllm checkout (registered as the vllm rig, the PRIMARY and ONLY rig this workflow is \
+expected to touch). Read-only context for the investigator; all edits happen in a \
+dedicated vllm rig worktree, never here."""
+default = "/home/ryrock/dev/vllm"
+pattern = "^(/.*)?$"
+
+[vars.aiter_repo_path]
+description = """\
+Host aiter checkout (registered as the aiter rig). STRICTLY read-only reference for this \
+workflow -- used only to read aiter/ops/topk.py's existing `topk_gating` implementation \
+and signature (to confirm it genuinely supports score_func="sigmoid" with a correctly \
+wired need_renorm, as claimed in {{known_context}}) and aiter/ops/moe_op.py's `topk_sigmoid` \
+(to confirm it still lacks renormalize support, or is otherwise broken, as the thing being \
+routed around). Do not create an aiter worktree, edit aiter, or run aiter's own build/install \
+in this workflow -- that belongs to the sibling aiter-rig formula instead."""
+default = "/home/ryrock/dev/aiter"
+pattern = "^(/.*)?$"
+
+[vars.base_ref]
+description = "Optional implementation base ref. Empty means: use the vllm rig's tip-of-tree default branch (main)."
+default = ""
+
+[vars.question]
+description = "Optional extra focus or hints."
+default = ""
+
+[vars.constraints]
+description = "Optional implementation focus, validation requirements, and resource limits."
+default = '''Scope this workflow to vLLM-side dispatch changes only (vllm/_aiter_ops.py and
+vllm/model_executor/layers/fused_moe/router/fused_topk_router.py, or whichever files the
+investigation finds actually own the dispatch chain -- do not assume these two are the only
+ones without checking). Do not modify aiter, do not create an aiter worktree, and do not
+attempt to fix aiter's topk_sigmoid directly -- that is the sibling formula
+aiter-topk-sigmoid-renormalize-fix.formula.toml's job, not this one. Scope test validation to
+tests/kernels/moe/test_fused_topk.py::test_fused_topk -k sigmoid only; the sibling tests
+test_fused_topk_bias / *_nan_inf_clamp go through a separate, untouched
+fused_topk_bias_router.py dispatch chain and are expected to be unaffected either way -- note,
+do not chase, any change observed there. Do not run `pip install` or `pip uninstall` (in any
+form, including `pip install -e .`) against vllm inside any container in this workflow, for any
+reason -- bind-mounting your worktree over /root/dev/vllm is sufficient for this dispatch-layer
+change, and reinstalling forces an unnecessary full C++/HIP extension rebuild (observed to
+stall for 30+ minutes) by hiding the image's prebuilt .so files. See {{editable_mode_notes}}
+for how to verify editable mode without reinstalling.'''
+
+[vars.known_context]
+description = "What is already known about this hypothesis, as unverified context to confirm, not an established fact."
+default = '''A prior, less rigorous ad hoc task (bead not part of this workflow; do not read or
+reuse any of its artifacts or patch files directly -- re-derive everything fresh) manually
+explored this exact hypothesis and reported the following, as leads to independently verify,
+not conclusions to copy:
+
+1. The underlying bug being routed around: vLLM's dispatch chain for scoring_func="sigmoid"
+   is fused_topk() (vllm/model_executor/layers/fused_moe/router/fused_topk_router.py) ->
+   dispatch_topk_sigmoid_func(use_rocm_aiter=True) -> rocm_aiter_ops.topk_sigmoid
+   (vllm/_aiter_ops.py) -> aiter.topk_sigmoid (aiter/ops/moe_op.py). aiter's topk_sigmoid has
+   no renormalize/need_renorm parameter at the Python, pybind, or C++ level, so
+   renormalize=True silently diverges from vLLM's own torch reference
+   (tests/kernels/moe/test_fused_topk.py's torch_topk helper) by as much as ~0.5 absolute.
+   Separately -- and this is specific to the `{{image}}` build pinned above, re-verify against
+   whatever image you actually use -- this image's baked-in aiter build may make
+   `aiter.topk_sigmoid` entirely uncallable (a SyntaxError raised from aiter's JIT
+   argument-checking exec() of a doc-string-derived function signature, apparently from a C++
+   type leaking unconverted into the generated Python doc string), which if present means even
+   renormalize=False sigmoid cases fail today, not just renormalize=True -- confirm whether
+   this additional, more severe failure mode is present in whatever image you use, and treat
+   it as a distinct finding from the renormalize gap, not the same bug.
+2. The candidate hypothesis: aiter exposes a SEPARATE, newer, unified top-k kernel,
+   `topk_gating` (aiter/ops/topk.py), which natively supports a `score_func` parameter
+   (including "sigmoid") and a correctly-wired `need_renorm` parameter -- i.e. renormalize
+   support that topk_sigmoid lacks already exists in this sibling kernel. vLLM already
+   dispatches its SOFTMAX scoring path through this same kernel today, on CDNA3/CDNA4
+   (gfx942/gfx950) hardware, via `rocm_aiter_ops.topk_gating` gated by
+   `rocm_aiter_ops.is_topk_gating_enabled()` and an internal `_aiter_topk_gating_supported()`
+   shape/dtype check (both in vllm/_aiter_ops.py) -- confirm these names, their current
+   signatures, and their exact gating conditions fresh against tip-of-tree, since they may
+   have shifted.
+3. The specific code shape explored (NOT verified by this workflow yet -- re-derive and
+   re-validate independently): extending `rocm_aiter_ops.topk_gating`'s existing call path (and
+   its underlying custom-op impl/fake functions in vllm/_aiter_ops.py) to accept and forward a
+   `score_func` argument instead of being hardcoded to softmax, adding a thin
+   `rocm_aiter_ops.topk_sigmoid_gating`-style entry point, and updating
+   `dispatch_topk_sigmoid_func()` in fused_topk_router.py to prefer this new path over
+   `rocm_aiter_ops.topk_sigmoid` whenever `is_topk_gating_enabled()` and
+   `_aiter_topk_gating_supported()` hold for the given shapes/dtypes -- falling back to the
+   existing topk_sigmoid path (or vLLM's native kernel) otherwise. Do not assume this exact
+   shape is correct or complete; verify aiter/ops/topk.py's actual `topk_gating` signature and
+   need_renorm wiring yourself, and check whether `_aiter_topk_gating_supported()`'s existing
+   shape/dtype gate (authored for the softmax path) is actually satisfied by the sigmoid test
+   cases in test_fused_topk.py, or needs its own adjustment.
+4. Reported (ad hoc, unverified by this workflow) result: all ~144 sigmoid-parametrized
+   `test_fused_topk` cases (both renormalize=True and renormalize=False, all dtypes) passed
+   under VLLM_ROCM_USE_AITER=1 after a change along these lines, inside `{{image}}` -- treat
+   this as the thing to reproduce and confirm from scratch, not as given. Note
+   VLLM_ROCM_USE_AITER=1 is required to exercise aiter's kernels at all; it defaults to False
+   in vllm/envs.py, and without it vLLM silently routes to its own native kernel, never
+   exercising aiter.'''
+
+[vars.editable_mode_notes]
+description = """\
+How to verify vLLM is genuinely running from your edited worktree inside the container, \
+not a stale copy."""
+default = '''`{{image}}` (resolve `<IMAGE>` to the concrete image stated directly above where
+this block is included) already has vllm `pip install -e`'d against /root/dev/vllm (a fixed
+commit, not necessarily tip-of-tree). The overwrite this task requires is: bind-mount your
+vllm rig worktree, READ-WRITE, over /root/dev/vllm inside the container (vllm's own build step
+is pure Python for this change -- no C++/CUDA/HIP rebuild should be required for a
+dispatch-layer change restricted to vllm/_aiter_ops.py and fused_topk_router.py; if your
+candidate genuinely needs a rebuild, say so explicitly and justify why). Verify genuine
+editable mode against YOUR worktree by: (a) `python -c "import vllm; print(vllm.__file__)"`
+resolving inside the mounted worktree, not a stale dist-packages copy; (b) the git HEAD at that
+path (`git -C <mounted-path> rev-parse HEAD`) matching your worktree's actual commit, not
+b689feb9f22129cb9ba65ea72e3e67e4a9c95355 (the image's baked-in commit) once you have made and
+committed your change. Do NOT run `pip install`, `pip uninstall`, `pip install -e .`, or any
+other pip install/uninstall command against vllm inside the container, for any reason,
+including to "verify" or "fix" editable mode -- the image's existing editable install already
+resolves vllm's Python source from whatever directory is bind-mounted at /root/dev/vllm, so
+simply mounting your worktree over that path is sufficient. Reinstalling is unnecessary for
+this dispatch-layer change and actively harmful: bind-mounting your worktree hides the image's
+prebuilt `.so` extension files, so a `pip install -e .` forces an unneeded full C++/HIP
+extension rebuild that can take 30+ minutes and has been observed to stall this exact workflow.
+If (a)/(b) above do not confirm genuine editable mode against your worktree, the fix is to
+correct the bind mount or the worktree itself (e.g. a dangling git-worktree pointer, a dubious
+ownership error resolved via `git config --global --add safe.directory`), never to reinstall
+the package. Do NOT bind-mount or modify /root/dev/aiter in this workflow -- leave
+the image's baked-in aiter install untouched; this hypothesis is specifically about avoiding
+any aiter-side change.'''
+
+[vars.gpu_rules]
+description = "Rules for using the local GPUs safely."
+default = '''LOCAL GPU RULES (this host has 8 MI300X GPUs, shared with other users).
+1. Use ONE GPU per container. Before every launch run `rocm-smi --showuse` and
+   `rocm-smi --showmeminfo vram`; pick a GPU with 0% use and ~no VRAM held.
+   Never use a busy GPU. Record the index in your report. Importing aiter
+   without real GPU access (no --device mapping) fails with "RuntimeError: No
+   gfx arch found in rocminfo output" -- this is expected and not itself a bug;
+   always run with real device access for anything beyond a plain syntax check.
+2. Run containers with `--device=/dev/kfd --device=/dev/dri --group-add video
+   --security-opt seccomp=unconfined --ipc=host --shm-size=16g` and
+   `-e HIP_VISIBLE_DEVICES=<idx>`, name them with your claimed bead ID, use
+   `--entrypoint bash` (the image entrypoint is not a shell), and `docker rm -f`
+   them when done, on every error path.
+3. aiter JIT-compiles kernels on first use and can take minutes; allow for it,
+   even though this workflow should not need to trigger a fresh aiter build if
+   it only touches vllm-side Python dispatch code.
+4. Do not modify the image. Do not run `docker commit` over `<IMAGE>` (resolve
+   this to the concrete image stated directly above where this block is
+   included). Bind-mount your vllm worktree READ-WRITE over /root/dev/vllm at
+   container-run time; the underlying image is never altered. Leave
+   /root/dev/aiter entirely alone -- do not mount anything over it.
+5. Disk: `/`, `/tmp`, `/root` share one overlay filesystem on this host (about
+   3.5T total; check `df -h` before large builds).'''
+
+[[steps]]
+id = "body"
+title = "Investigate, experiment, and evaluate a vllm-only topk_gating-based alternative to patching aiter's topk_sigmoid"
+needs = ["implement"]
+metadata = { "gc.kind" = "scope", "gc.scope_name" = "vllm-topk-gating-sigmoid-alt-fix", "gc.scope_role" = "body" }
+
+[[steps]]
+id = "investigate"
+title = "Investigate whether routing sigmoid-scored MoE top-k through aiter's topk_gating kernel (instead of topk_sigmoid) is a viable vllm-only fix"
+needs = []
+metadata = { "gc.run_target" = "vllm/investigation.investigator", "gc.scope_ref" = "body", "gc.scope_role" = "member", "gc.on_fail" = "abort_scope" }
+description = """
+Investigate the hypothesis: vLLM's `tests/kernels/moe/test_fused_topk.py::test_fused_topk -k
+sigmoid` fails for `renormalize=True` (and possibly more broadly, depending on the image) when
+routed through aiter's `topk_sigmoid` op via VLLM_ROCM_USE_AITER=1, because that op has no
+renormalize support. aiter separately exposes a `topk_gating` kernel that DOES support
+`score_func="sigmoid"` with working `need_renorm` -- the same kernel vLLM already uses for its
+softmax scoring path on gfx942/gfx950. Determine whether vLLM's dispatch can be changed to
+route sigmoid scoring through `topk_gating` instead of `topk_sigmoid`, fixing the test
+failures WITHOUT any change to aiter itself.
+
+Context, as unverified claims to confirm (not established facts):
+
+IMAGE={{image}} CONSTRAINTS={{constraints}} -- resolve `<IMAGE>`/`<CONSTRAINTS>` in the
+context below to these values.
+
+{{known_context}}
+
+Scope and exclusions: {{constraints}}
+
+How to verify you are running from your own edited vllm worktree inside the container:
+
+IMAGE={{image}} -- resolve `<IMAGE>` in the notes below to this value.
+
+{{editable_mode_notes}}
+
+Environment: use the local docker image `{{image}}` (already present locally; do not pull).
+Resolve the vllm rig's source repository and tip-of-tree commit using `gc rig list --json`
+(registered path hint: {{repo_path}}); do not assume this hint is accurate without verifying
+it against the rig registration. Resolve the aiter rig the same way purely for READ-ONLY
+reference (registered path hint: {{aiter_repo_path}}) -- you need it to read
+aiter/ops/topk.py's `topk_gating` and aiter/ops/moe_op.py's `topk_sigmoid` source, not to edit
+or build it.
+
+IMAGE={{image}} -- resolve `<IMAGE>` in the rules below to this value.
+
+{{gpu_rules}}
+
+Additional focus or hints: {{question}}
+
+Diagnose and design only; do not implement the production fix in this step. If you need to
+read source or run a quick experiment, use your own isolated worktree (never the shared vllm
+checkout) at `~/dev/cities/gc-worktrees/vllm/{{formula_id}}/investigate/<claimed-bead-id>` on
+branch `{{formula_id}}/investigate/<claimed-bead-id>`, per your pack's worktree protocol.
+Concretely:
+
+- Read aiter/ops/topk.py's `topk_gating` function signature and implementation in full (via
+  {{aiter_repo_path}}, read-only) and confirm, from the source itself, that it genuinely
+  accepts or can be made to accept `score_func="sigmoid"` with a correctly-wired
+  `need_renorm`, not assuming the claim in {{known_context}} is accurate.
+- Read aiter/ops/moe_op.py's `topk_sigmoid` and confirm it still lacks renormalize support (or
+  is otherwise broken in whatever image you use) -- this is the op being routed around, so
+  confirm the premise before designing around it.
+- Read vllm/_aiter_ops.py's current `rocm_aiter_ops.topk_gating`,
+  `rocm_aiter_ops.topk_sigmoid`, `rocm_aiter_ops.is_topk_gating_enabled`, and the internal
+  `_aiter_topk_gating_supported` (names and exact locations may have shifted since
+  {{known_context}} was written -- find them fresh) and read
+  vllm/model_executor/layers/fused_moe/router/fused_topk_router.py's `dispatch_topk_sigmoid_func`
+  and `fused_topk` call sites in full.
+- Reproduce the baseline failure first: run
+  `tests/kernels/moe/test_fused_topk.py::test_fused_topk -k sigmoid` with
+  VLLM_ROCM_USE_AITER=1 against the unmodified image and record the failure mode(s) exactly
+  (which parametrizations fail, and whether any fail with a hard exception vs. a numerical
+  mismatch) -- do not assume the failure shape from {{known_context}} without seeing it
+  yourself in this environment.
+- Design the smallest vllm-only dispatch change that would route the sigmoid test cases
+  through `topk_gating(score_func="sigmoid")` instead of `topk_sigmoid`, identifying every
+  file and function that needs to change, and whether `_aiter_topk_gating_supported()`'s
+  existing shape/dtype gate (authored for the softmax path) actually covers the sigmoid test
+  cases or needs adjusting.
+- Flag explicitly if any part of a viable fix would require touching aiter (not just vllm) --
+  if so, that is out of scope for this workflow per {{constraints}}; record it as a finding for
+  a human or the sibling aiter-rig formula to pick up, and do not implement it here.
+
+Use `{{artifact_dir}}` as the shared directory for this run. Write your artifacts under
+`{{artifact_dir}}/investigate/`, creating that subdirectory if needed; it must not contain an
+earlier run's reports. Do not overwrite existing files.
+
+Before closing this step, write `{{artifact_dir}}/investigate/investigation.md` with:
+- Your claimed bead ID, the vllm and aiter tip-of-tree commits used (and whether aiter's is
+  the image's baked-in commit, since you should not be building a new one), and date.
+- The exact reproduction command, container name/flags, GPU index, environment variables,
+  versions; mark missing information.
+- Fresh findings with file:line references (in the vllm worktree and the aiter read-only
+  checkout) and raw output paths. Separate fresh observations from the supplied context and
+  from untested hypotheses.
+- A definitive, evidence-backed answer to: is a vllm-only (no-aiter-change) fix viable given
+  topk_gating's actual current signature and need_renorm wiring? If not viable, say exactly
+  why (e.g. a required aiter-side signature change, a missing score_func plumbing point, or a
+  shape/dtype gate that cannot be satisfied without an aiter change).
+- A minimal experiment plan for the experimenter: hypothesis, prediction, control, exact
+  commands, distinguishing result.
+- Explicit confirmation of what is and is not in scope per {{constraints}}.
+
+Append the handoff summary and absolute report path to this claimed step's notes with
+`gc bd update <claimed-bead-id> --append-notes <text>` and record
+`--set-metadata investigation.report_path=<path>`. Verify the report is readable, then set
+`gc.outcome=pass` on this claimed step and close only it.
+
+If blocked (image missing, no idle GPU, cannot produce a usable handoff), append the reason,
+set `gc.outcome=fail` and `gc.failure_reason=<reason>`, and close only this step. Do not close
+the workflow root.
+"""
+
+[[steps]]
+id = "experiment"
+title = "Validate the topk_gating-based alternative dispatch with minimal experiments"
+needs = ["investigate"]
+metadata = { "gc.run_target" = "vllm/experimentation.experimenter", "gc.scope_ref" = "body", "gc.scope_role" = "member", "gc.on_fail" = "abort_scope" }
+description = """
+Read `{{artifact_dir}}/investigate/investigation.md` before running anything. Read the
+producer bead ID recorded in it, and verify it belongs to the same `gc.root_bead_id` as your
+claimed step and has `gc.outcome=pass`. Test environment: docker image `{{image}}`.
+
+Scope and exclusions: {{constraints}}
+
+IMAGE={{image}} -- resolve `<IMAGE>` in the rules below to this value.
+
+{{gpu_rules}}
+
+Additional focus or hints: {{question}}
+
+Use a worktree at `~/dev/cities/gc-worktrees/vllm/{{formula_id}}/experiment/<claimed-bead-id>`
+on branch `{{formula_id}}/experiment/<claimed-bead-id>`, per your pack's worktree protocol.
+Do not create or edit an aiter worktree; {{aiter_repo_path}} is read-only reference only.
+
+Test the handoff's hypotheses; do not assume its conclusions are correct, including whether a
+vllm-only fix is genuinely viable -- re-derive the dispatch change yourself and confirm it
+against a real run, not just against the investigation's description of it. Follow your
+six-step protocol for every experiment: hypothesis, prediction (recorded before running),
+exact command/environment, run, actual result, verdict (supports / contradicts /
+inconclusive). Prefer the smallest experiments that separate the hypotheses, for example:
+
+- Confirm the baseline failure reproduces fresh in your own environment (do not reuse the
+  investigation step's raw logs as your own evidence) by running
+  `tests/kernels/moe/test_fused_topk.py::test_fused_topk -k sigmoid` with
+  VLLM_ROCM_USE_AITER=1 against the unmodified image.
+- Implement the investigation's candidate dispatch change (routing sigmoid scoring through
+  `topk_gating(score_func="sigmoid")`) in your experiment worktree, bind-mounted read-write
+  over /root/dev/vllm, and confirm the change is actually in effect
+  (`vllm.__file__`/git HEAD per {{editable_mode_notes}}) before trusting any result.
+- Re-run the same test target with the candidate change applied and record the exact
+  pass/fail counts, comparing directly to the baseline run above.
+- Check whether `_aiter_topk_gating_supported()`'s existing shape/dtype gate actually accepts
+  every sigmoid test parametrization, or silently falls through to the old `topk_sigmoid` path
+  (or vLLM's native kernel) for some cases -- if some cases fall through, report exactly which
+  and whether they still fail as a result.
+- Confirm no regression in `tests/kernels/moe/test_fused_topk.py::test_fused_topk_bias` and the
+  `*_nan_inf_clamp` variants (expected unaffected, per {{constraints}}, since they use a
+  separate router) -- report their before/after status for visibility only, do not fix
+  anything found there.
+- If the investigation flagged that a viable fix requires an aiter-side change too, design and
+  run the smallest experiment that confirms (or refutes) that claim, without actually editing
+  aiter (e.g. by checking topk_gating's real current behavior/signature against what a vllm
+  dispatch change alone can supply).
+
+Save experiment records and raw output under `{{artifact_dir}}/experiment/` (creating it if
+needed) and write `{{artifact_dir}}/experiment/experiments.md` with the producer bead ID, every
+experiment's six steps, evidence paths, verdicts, uncertainties, and a recommended fix
+direction naming the exact vllm source file(s)/function(s), the change, and the tested
+revision -- or, if the hypothesis is refuted, a clear statement of why a vllm-only fix is not
+viable. Do not implement the production fix in the shared vllm checkout; candidate edits
+belong only in your own experiment worktree.
+
+Append the summary and absolute artifact paths to this claimed step's notes with
+`gc bd update <claimed-bead-id> --append-notes <text>`, set `experiment.report_path=<path>`
+and `gc.outcome=pass`, and close only this step. `pass` means the experiments were completed,
+even if the hypothesis is contradicted or inconclusive.
+
+If the handoff is missing, stale, or unusable, or runtime resources prevent execution, record
+the blocker, set `gc.outcome=fail` and `gc.failure_reason=<reason>`, and close only this step.
+Do not fabricate results or close earlier steps or the workflow root.
+"""
+
+[[steps]]
+id = "implement"
+title = "Implement, validate, and commit the vllm-only topk_gating-based dispatch fix, if the experiments support it"
+needs = ["experiment"]
+metadata = { "gc.run_target" = "vllm/implementation.implementer", "gc.scope_ref" = "body", "gc.scope_role" = "member", "gc.on_fail" = "abort_scope" }
+description = """
+Read `{{artifact_dir}}/experiment/experiments.md`, the producer experiment bead, and the
+investigation artifacts it cites. Verify the investigation and experiment step beads belong to
+your `gc.root_bead_id`, completed with `gc.outcome=pass`, and recorded the report paths you are
+reading; record their IDs and paths on your claimed step.
+
+If the experiments concluded a vllm-only fix is NOT viable (e.g. it genuinely requires an
+aiter-side change), write the report documenting that conclusion and the evidence for it, set
+`gc.outcome=pass`, and close only your step -- do not proceed with the remaining
+implementation instructions below. Recommend the sibling aiter-rig formula
+(aiter-topk-sigmoid-renormalize-fix.formula.toml) or a human follow-up for the aiter-side half,
+rather than implementing it yourself.
+
+If the experiments did validate a vllm-only fix, additional scope and resource constraints:
+{{constraints}}
+
+IMAGE={{image}} -- resolve `<IMAGE>` in the rules below to this value.
+
+{{gpu_rules}}
+
+Choose the smallest coherent fix supported by the experiments' winning candidate, touching only
+the vllm rig (vllm/_aiter_ops.py, vllm/model_executor/layers/fused_moe/router/fused_topk_router.py,
+or whichever files the experiments actually validated -- do not assume these two are exhaustive
+without checking). Do not touch the aiter checkout. Resolve the vllm rig's authoritative path
+via `gc rig list --json` (registered path hint: {{repo_path}}); do not assume the hint is
+accurate without verifying it. Optional base-ref override: {{base_ref}}; if empty, use the
+vllm rig's tip-of-tree default branch.
+
+Follow your worktree protocol. Record the shared vllm checkout's dirty state, branch/HEAD, and
+protected main/default-branch refs. Create/recover the linked worktree
+`~/dev/cities/gc-worktrees/vllm/{{formula_id}}/implement/<claimed-bead-id>` on branch
+`{{formula_id}}/implement/<claimed-bead-id>`, verifying repository, path, ownership, and branch
+before any edit. Save its absolute path as `work_dir` and record
+`implementation.worktree_path`, `implementation.branch`, and `implementation.base_commit`. All
+edits, builds, tests, staging, and commits happen there. Never modify the shared vllm checkout,
+never advance main, never edit the docker image, never create or touch an aiter worktree.
+
+Implement the fix with focused regression coverage (e.g. a test in
+tests/kernels/moe/test_fused_topk.py or a new dedicated test confirming the sigmoid dispatch
+path reaches `topk_gating` rather than `topk_sigmoid` when eligible, and that the fallback path
+still works when not eligible). Validate by bind-mounting YOUR implementation worktree
+read-write over /root/dev/vllm inside a container from `{{image}}` (confirm genuine editable
+mode per {{editable_mode_notes}} before trusting any result):
+1. The original baseline failure (fresh reproduction against the unmodified image before your
+   fix is applied in the worktree).
+2. The previously-failing sigmoid cases (renormalize=True, and any other failure mode found in
+   investigate/experiment) now passing via
+   `tests/kernels/moe/test_fused_topk.py::test_fused_topk -k sigmoid` with
+   VLLM_ROCM_USE_AITER=1.
+3. No regression in `test_fused_topk_bias` / `*_nan_inf_clamp` (expected unaffected; report
+   their before/after status for visibility only).
+4. The repository's required lint/pre-commit hooks on changed files.
+Report which results are proxy-only and what remains untested.
+
+After validation passes, recheck the worktree and branch, stage only intended files by explicit
+path, inspect the staged diff, run `git diff --cached --check`, and commit on
+`{{formula_id}}/implement/<claimed-bead-id>` following the vllm repository's commit/DCO/hook
+rules. Never bypass failing hooks. Record the full commit hash as
+`implementation.commit_hash`. Do not merge, push, or open a PR.
+
+Use `{{artifact_dir}}/implement/` for this run's artifacts (creating it if needed). Write
+`{{artifact_dir}}/implement/implementation.md` (source/producer IDs, fix and rationale,
+worktree/branch/base/fix commits, the editable-mode verification used for validation,
+validation commands and results, limitations, artifact paths) and export
+`{{artifact_dir}}/implement/implementation.patch` with `git diff --binary <base-commit>
+<fix-commit>`. Append the summary and paths to your claimed bead, set
+`implementation.report_path`, `implementation.patch_path`, `implementation.commit_hash`, and
+`gc.outcome=pass`, then close only your step.
+
+If no justified fix exists, required validation is unavailable, or committing fails, write a
+partial report with blockers, preserve worktree progress, set `gc.outcome=fail` and
+`gc.failure_reason`, and close only your step. Do not close earlier steps or the workflow root.
+"""
