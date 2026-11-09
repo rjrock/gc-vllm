@@ -1,0 +1,613 @@
+formula = "flint-rocm-attention-fix"
+version = 1
+description = """\
+Investigate -> experiment -> implement a fix so the RecursiveSI/flint model \
+(vllm/models/flint/model.py) can actually be served by vLLM on ROCm/MI300X (gfx942) \
+hardware at all. Today it cannot: `FlintAttention.__init__` unconditionally does `from \
+vllm.v1.attention.backends.flashinfer import (FlashInferImpl, FlashInferMetadata, \
+FlashInferTrtllmAPIDecode)` and then hard-asserts `isinstance(impl, FlashInferImpl)` \
+(vllm/models/flint/model.py, around line 311) -- but FlashInfer (PyPI packages \
+`flashinfer`/`flashinfer-python`) has no ROCm/HIP build at all, only CUDA/NVCC \
+wheels, so the import itself raises `ModuleNotFoundError: No module named \
+'flashinfer'` before the assertion is ever reached, crashing engine-core startup \
+on any ROCm host. This blocks an unrelated, already-complete piece of work (a \
+vllm-side sigmoid MoE top-k dispatch fix, root bead vl-1llh, formula \
+`vllm-topk-gating-sigmoid-alt-fix`) from being benchmarked end-to-end via \
+llm-bench-runner, since Flint is the only model that exercises that dispatch path \
+and it cannot be served on this project's only available hardware (ROCm MI300X). \
+This workflow's job is to determine whether Flint's attention implementation can be \
+made to work on ROCm -- e.g. by falling back to vLLM's already-functional, \
+backend-agnostic generic attention path (`unified_attention_with_output`, which this \
+same file already calls for every token except small pure-decode batches) instead of \
+the FlashInfer-specific metadata/decode fast path -- or by some other means, and to \
+implement whichever approach the investigation/experiments actually validate. The \
+goal is FUNCTIONAL parity (Flint starts and serves correct completions on ROCm), not \
+performance parity with its CUDA/FlashInfer/SM100 fast paths, which are expected to \
+remain CUDA-only."""
+
+[requires]
+formula_compiler = ">=2.0.0"
+
+[vars.artifact_dir]
+description = "Absolute, shared artifact directory, unique to this workflow run."
+required = true
+pattern = "^/"
+
+[vars.formula_id]
+description = """\
+Run identifier used to label this run's worktree directories and branches \
+(vllm/{{formula_id}}/<step>/<bead-id>). Defaults to this formula's name."""
+default = "flint-rocm-attention-fix"
+pattern = "^[A-Za-z0-9_.-]+$"
+
+[vars.image]
+description = """\
+Local docker image to reproduce and validate in, on this host (localhost, no ssh \
+needed -- this is an 8x MI300X/gfx942 machine). Already present locally (no pull \
+needed): confirmed present as of formula-authoring time (2026-10-28) via `docker \
+image inspect {{image}}`. Contains an editable vllm at /root/dev/vllm (git HEAD \
+317081fb6dc8b125a3134711a7750707bfd55371, confirmed to already contain \
+vllm/models/flint/ -- this image already has Flint model support, the bug is a \
+missing/incompatible dependency, not a missing model) and does NOT have flashinfer \
+installed (confirmed via `pip show flashinfer flashinfer-python` inside the image: \
+"Package(s) not found" for both -- expected and correct, since no ROCm/HIP build of \
+flashinfer exists to install). Re-verify presence and HEAD commit fresh rather than \
+trusting this note, since newer tags may exist locally (`docker images | grep \
+vllm-ci-ext`) -- a newer dated tag (e.g. a later `rjrock2/vllm-ci-ext:octNN`) may be \
+preferable if one exists and is confirmed equivalent in the dimensions that matter \
+here (editable vllm checkout, no flashinfer, ROCm/HIP build toolchain)."""
+default = "rjrock2/vllm-ci-ext:oct28"
+
+[vars.repo_path]
+description = """\
+Host vllm checkout (registered as the vllm rig). Read-only context; all edits happen \
+in a dedicated vllm rig worktree, never here. Resolve the authoritative path via `gc \
+rig list --json` rather than trusting this hint blindly."""
+default = "/home/ryrock/dev/vllm"
+pattern = "^(/.*)?$"
+
+[vars.model_path]
+description = """\
+Host path to the already-downloaded RecursiveSI/flint checkpoint (bf16 safetensors, \
+~75GB across 15 shards, plus config/tokenizer files) used for real end-to-end `vllm \
+serve` validation. Already present on this host; do not re-download. A real served \
+query response against these actual weights is the end goal of this workflow, not \
+just a passing unit test -- do not substitute a dummy/tiny model for final \
+validation, though a smaller synthetic harness (e.g. a stub attention backend, or a \
+unit test with mocked shapes) may be useful for isolating an intermediate blocker."""
+default = "/data/models/flint"
+pattern = "^(/.*)?$"
+
+[vars.base_ref]
+description = "Optional implementation base ref. Empty means: use the vllm rig's tip-of-tree default branch (main)."
+default = ""
+
+[vars.question]
+description = "Optional extra focus or hints."
+default = ""
+
+[vars.constraints]
+description = "Optional implementation focus, validation requirements, and resource limits."
+default = '''Scope this workflow to making Flint SERVABLE on ROCm/gfx942 -- functional
+parity via vLLM's existing generic, backend-agnostic attention execution path
+(`unified_attention_with_output`, vllm/model_executor/layers/attention/attention.py),
+not performance parity with Flint's CUDA-only fast paths. Explicitly OUT OF SCOPE:
+porting Flint's SM100-only fused low-latency decode kernels (`_flint_kernels()`,
+gated on `current_platform.is_device_capability_family(100)` -- already False on
+ROCm/gfx942, so this path is already inert there and should stay that way) or its
+NVFP4/cutlass/cute/quack-based ops (vllm/models/flint/ops/decode_attention.py,
+moe_gemv.py, nvfp4_gemv.py, etc., all CUDA/Blackwell-specific) to ROCm; leave those
+code paths exactly as-is, guarded exactly as they already are. Do not add a
+dependency on flashinfer, a ROCm build of flashinfer, or any other CUDA-only
+package to the ROCm code path. Do not modify aiter. The one thing that MUST change is
+`FlintAttention.__init__`'s unconditional FlashInfer import/assertion (and anything
+else in vllm/models/flint/ that makes the same unconditional assumption -- check
+every file in vllm/models/flint/, not just model.py, before assuming that is the only
+place) so that it degrades gracefully on a platform/backend where FlashInfer is
+unavailable, instead of crashing at model construction time. Preserve the existing
+CUDA/FlashInfer-path behavior and its test coverage
+(tests/models/flint/test_flint_ops.py, test_decode_attention.py, test_qk_norm_rope.py,
+test_qkv_fused.py, test_flint_moe.py, test_gguf_nvfp4.py) exactly unchanged for CUDA;
+these tests may not be runnable on this ROCm host at all (most exercise
+cutlass/cute/quack kernels that only build for CUDA/SM100) -- if so, state plainly
+that they could not be run here rather than fabricating a result, and rely on a
+static/import-level check (e.g. that the CUDA code path is still reached unchanged,
+behind an unchanged guard) plus the sibling aiter-rig/vllm-rig reviewers' judgment.
+Primary end-to-end success criterion: on this host, `docker run` (or, for the final
+llm-bench-runner-facing validation, `uv run launch` from
+/home/ryrock/dev/llm-bench-runner, which already has a recipe at
+recipes/flint/topk-gating/server.yaml and a captured failure log at
+recipes/flint/topk-gating/logs/before/server.log for this exact blocker) a `vllm
+serve` of {{model_path}} with `--tensor-parallel-size=1` and
+`VLLM_ROCM_USE_AITER=1`, on this host's GPUs, reaches a ready HTTP server and returns
+a real, sane (not just "some tokens came back") chat completion response. Do not
+run `pip install`/`pip uninstall` against vllm inside any container in this workflow,
+for any reason -- see {{editable_mode_notes}}.'''
+
+[vars.known_context]
+description = "What is already known about this blocker, as unverified leads to confirm, not established facts."
+default = '''A prior, less rigorous ad hoc task (bead not part of this workflow; do not
+read or reuse its artifacts directly -- re-derive everything fresh) manually attempted
+to serve Flint on this host and reported the following, as leads to independently
+verify, not conclusions to copy:
+
+1. Root cause, as observed in a real crash: launching `vllm serve /data/models/flint
+   --tensor-parallel-size=1` with `VLLM_ROCM_USE_AITER=1` against image {{image}}
+   crashes EngineCore at startup with, verbatim (captured in
+   /home/ryrock/dev/llm-bench-runner/recipes/flint/topk-gating/logs/before/server.log):
+   ```
+   File "/root/dev/vllm/vllm/models/flint/model.py", line 311, in __init__
+       from vllm.v1.attention.backends.flashinfer import (
+   File "/root/dev/vllm/vllm/v1/attention/backends/flashinfer.py", line 12, in <module>
+       from flashinfer import (
+   ModuleNotFoundError: No module named 'flashinfer'
+   ```
+   Confirm this recurs verbatim fresh, on whichever image/commit you actually use,
+   rather than assuming it is still exactly this shape.
+2. FlashInfer (PyPI packages `flashinfer` and `flashinfer-python`, latest
+   flashinfer-python 0.7.2.post1 at investigation time) has NO ROCm/HIP build on
+   PyPI at all -- confirmed by wheel content inspection (0 files matching
+   "rocm"/"hip" case-insensitive; NVCC-specific symbols like `JitSpecNvcc`,
+   `sm90a_nvcc_flags`, `sm100a_nvcc_flags` throughout) and by `pip download
+   flashinfer --no-deps` returning "No matching distribution found". Re-verify this
+   is still true rather than assuming it is permanent -- if a ROCm/HIP build has
+   since appeared, that may change which fix direction is smallest/best, though
+   pulling in a brand-new, unvetted dependency build is unlikely to be preferable to
+   using vLLM's already-working generic attention path.
+3. Separately, and NOT yet connected to a fix by the prior ad hoc task: vLLM's own
+   ROCm attention-backend auto-selection logic (vllm/platforms/rocm.py, the backend
+   selection function that logs "Found incompatible backend(s) [...] with
+   AttentionType.DECODER. Overriding with X out of potential backends: [...]") already
+   ran, on this exact failing launch, BEFORE Flint's own `__init__` code executed, and
+   selected `ROCM_AITER_FA` as the viable backend for this hardware, out of candidates
+   `['ROCM_AITER_FA', 'ROCM_AITER_UNIFIED_ATTN', 'TRITON_ATTN']` (confirmed via a log
+   line captured in the same server.log, timestamped immediately before the
+   ModuleNotFoundError). In other words, `self.attn` (a standard vLLM `Attention`
+   layer, vllm/model_executor/layers/attention/attention.py) had ALREADY resolved
+   `self.attn.impl` to a working ROCm-native implementation (not a FlashInferImpl) via
+   vLLM's standard `get_attn_backend()` machinery, by the time Flint's own code
+   unconditionally imported FlashInfer-specific types and asserted
+   `isinstance(impl, FlashInferImpl)` purely to wire up `self._metadata_cls` /
+   `self._decode_cls` for its FlashInfer-specific decode fast path. That assertion
+   would have failed on its own terms (impl is not a FlashInferImpl on this hardware)
+   even if the import had not crashed first -- confirm this reasoning yourself against
+   the actual object returned, do not assume it from the log alone.
+4. FlintAttention's `forward()` (vllm/models/flint/model.py) already has TWO paths:
+   a FlashInfer-specific pure-decode fast path (`_decode_plan()` /
+   `_run_decode_attention()`, only reachable when `self.flint_decode` is true) and a
+   generic path calling `unified_attention_with_output(...)`
+   (vllm/model_executor/layers/attention/attention.py:769) through
+   `self.attn.layer_name` -- the same backend-agnostic entry point every other
+   non-Flint vLLM model uses, which works with whatever backend
+   `get_attn_backend()` resolved (including ROCM_AITER_FA/TRITON_ATTN on this
+   hardware). `self.flint_decode` is set via `_flint_kernels(quant_config)`
+   (model.py, top of file), which returns False unconditionally unless
+   `current_platform.is_device_capability_family(100)` (SM100/Blackwell) holds --
+   i.e. on ROCm, `self.flint_decode` is already always False, so the FlashInfer-only
+   fast path is already never exercised at runtime on this hardware; only the
+   generic `unified_attention_with_output` path would ever actually run. This is the
+   strongest candidate lead: the unconditional FlashInfer
+   import/`_metadata_cls`/`_decode_cls` setup in `__init__` may be dead weight on
+   ROCm that exists only to serve a fast path that is already structurally disabled
+   there -- confirm whether `self._metadata_cls`/`self._decode_cls` (and `self.impl`,
+   separately assigned right after) are read ANYWHERE outside the
+   `self.flint_decode`-gated methods (`_decode_plan`, `_run_decode_attention`) before
+   concluding they can simply be skipped when FlashInfer is unavailable or
+   `self.flint_decode` is False; `self.impl = impl` in particular may be used more
+   broadly (e.g. `self.impl.window_left`, `self.impl.scale`, `self.impl.sinks` are
+   read in `_run_decode_attention`, also flint_decode-gated, per a fresh read -- but
+   confirm there is no OTHER reader before assuming it is unconditionally safe to
+   leave `self.impl` unset or set differently when the FlashInfer import is skipped).
+5. Not yet checked by the prior ad hoc task, and explicitly left to this
+   investigation: whether any OTHER file under vllm/models/flint/ (configs.py,
+   __init__.py, gguf_nvfp4.py, or any file under ops/) makes a similar unconditional
+   CUDA/FlashInfer/SM100-only assumption that would also need to degrade gracefully
+   on ROCm -- e.g. ops/decode_attention.py and ops/moe_gemv.py/nvfp4_gemv.py import
+   `cutlass`/`cutlass.cute`/`quack` unconditionally at module level (CUDA-only
+   packages); confirm whether these module-level imports are reached at all when
+   Flint is loaded on ROCm (they may only be imported lazily, inside functions
+   gated by `_flint_kernels()`, similar to model.py's FlashInfer import -- or they
+   may be hit at import time regardless, which would be a second, separate crash to
+   fix). Do not assume model.py's FlashInfer import is the only blocker without
+   checking.
+6. The downstream consumer of a working fix is
+   /home/ryrock/dev/llm-bench-runner/recipes/flint/topk-gating/server.yaml (already
+   authored, currently unusable) -- a successful fix should make `uv run launch
+   --config-file=recipes/flint/topk-gating/server.yaml --warmup --collect-metrics
+   --run-gsm8k ...` (run from the llm-bench-runner venv, NOT a raw `docker run`)
+   actually reach a ready server and serve real gsm8k/completions traffic, for a
+   downstream before/after benchmark of an unrelated vllm dispatch fix (root bead
+   vl-1llh) that this blocker has been preventing from being measured end-to-end.'''
+
+[vars.gpu_rules]
+description = "Rules for using the local GPUs safely."
+default = '''LOCAL GPU RULES (this host has 8 MI300X GPUs, gfx942, shared with other
+users).
+1. Use ONE GPU per container for investigate/experiment iteration (TP=1 is this
+   model's only required configuration here). Before every launch run `rocm-smi
+   --showuse` and `rocm-smi --showmeminfo vram`; pick a GPU with 0% use and ~no VRAM
+   held. Never use a busy GPU. Record the index in your report.
+2. Run containers with `--device=/dev/kfd --device=/dev/dri --group-add video
+   --security-opt seccomp=unconfined --ipc=host --shm-size=16g` and `-e
+   HIP_VISIBLE_DEVICES=<idx>`, name them with your claimed bead ID, use `--entrypoint
+   bash` for interactive/debug containers (the image entrypoint is not a shell) or
+   `--entrypoint vllm` for a direct serve launch, and `docker rm -f` them when done,
+   on every error path.
+3. The final, downstream-facing validation (per {{constraints}} point 6) should use
+   `uv run launch` from the venv at /home/ryrock/dev/llm-bench-runner rather than a
+   raw `docker run`, for any step that is actually standing up a server to serve
+   real traffic end-to-end (as opposed to a quick interactive debug container used
+   while iterating on the fix itself, which may use docker directly).
+4. Flint's checkpoint at {{model_path}} is ~75GB (bf16); a single MI300X has ample
+   VRAM headroom for TP=1, but confirm actual usage with `rocm-smi --showmeminfo
+   vram` rather than assuming.
+5. Do not modify the image. Do not run `docker commit` over `{{image}}`. Bind-mount
+   your vllm worktree READ-WRITE over /root/dev/vllm at container-run time; the
+   underlying image is never altered.
+6. Disk: `/`, `/tmp`, `/root` share one overlay filesystem on this host (about 3.5T
+   total; check `df -h` before large builds).'''
+
+[vars.editable_mode_notes]
+description = """\
+How to verify vLLM is genuinely running from your edited worktree inside the container, \
+not a stale copy."""
+default = '''`{{image}}` (resolve `<IMAGE>` to the concrete image stated directly above
+where this block is included) already has vllm `pip install -e`'d against
+/root/dev/vllm (a fixed commit, not necessarily tip-of-tree). The overwrite this task
+requires is: bind-mount your vllm rig worktree, READ-WRITE, over /root/dev/vllm inside
+the container (this is a pure-Python fix -- model-loading/attention-dispatch glue code,
+not a compiled kernel -- so no C++/CUDA/HIP rebuild should be required; if your
+candidate genuinely needs a rebuild, say so explicitly and justify why). Verify genuine
+editable mode against YOUR worktree by: (a) `python3 -c "import vllm; print(vllm.__file__)"`
+resolving inside the mounted worktree, not a stale dist-packages copy; (b) the git HEAD
+at that path (`git -C <mounted-path> rev-parse HEAD`) matching your worktree's actual
+commit, not 317081fb6dc8b125a3134711a7750707bfd55371 (the image's baked-in commit) once
+you have made and committed your change. Do NOT run `pip install`, `pip uninstall`, `pip
+install -e .`, or any other pip install/uninstall command against vllm inside the
+container, for any reason, including to "verify" or "fix" editable mode, and do NOT
+attempt to `pip install flashinfer`/`flashinfer-python` (it has no ROCm/HIP build --
+see {{known_context}} -- so this would simply fail or install a useless CUDA-only
+wheel) -- the image's existing editable install already resolves vllm's Python source
+from whatever directory is bind-mounted at /root/dev/vllm, so simply mounting your
+worktree over that path is sufficient. Reinstalling is unnecessary for this kind of
+change and actively harmful: bind-mounting your worktree hides the image's prebuilt
+`.so` extension files, so a `pip install -e .` forces an unneeded full C++/HIP
+extension rebuild that can take 30+ minutes. If (a)/(b) above do not confirm genuine
+editable mode against your worktree, the fix is to correct the bind mount or the
+worktree itself (e.g. a dangling git-worktree pointer, a dubious ownership error
+resolved via `git config --global --add safe.directory`), never to reinstall the
+package. Do NOT bind-mount or modify any aiter checkout in this workflow.'''
+
+[vars.on_fail_followup_formula]
+description = """\
+Optional hint, not a requirement: every workflow in this city is auto-triaged on \
+failure by the general on-fail-followup order (orders/on-fail-followup.toml), which \
+routes the failure report to the mayor to decide what (if anything) to do next -- \
+including authoring a brand-new follow-up formula that didn't exist when this formula \
+was written. This var exists only as a fast-path for the case where, at authoring \
+time, we already know what the right follow-up attempt would be: set it and the mayor \
+can skip straight to launching it instead of re-deriving the same conclusion from \
+scratch. Defaults to flint-kv-cache-layout-fix, the follow-up formula authored to \
+pursue the KV-cache layout fix recommended in this workflow's own experiments.md if \
+the generic-attention-fallback fix alone proves insufficient. Leave empty to let the \
+mayor decide unprompted."""
+default = "flint-kv-cache-layout-fix"
+
+[vars.on_fail_followup_target]
+description = """\
+Sling target for {{on_fail_followup_formula}}, used only if that var is non-empty."""
+default = "vllm/investigation.investigator"
+
+[[steps]]
+id = "body"
+title = "Investigate, experiment, and implement a fix so Flint can be served on ROCm/gfx942"
+needs = ["implement"]
+metadata = { "gc.kind" = "scope", "gc.scope_name" = "flint-rocm-attention-fix", "gc.scope_role" = "body" }
+
+[[steps]]
+id = "investigate"
+title = "Investigate why Flint cannot be served on ROCm and whether a vLLM-generic attention fallback is viable"
+needs = []
+metadata = { "gc.run_target" = "vllm/investigation.investigator", "gc.scope_ref" = "body", "gc.scope_role" = "member", "gc.on_fail" = "abort_scope" }
+description = """
+Investigate the hypothesis: Flint (vllm/models/flint/model.py) can be made servable on
+ROCm/gfx942 by making `FlintAttention.__init__`'s unconditional FlashInfer
+import/assertion conditional, falling back to vLLM's already-functional, backend-
+agnostic `unified_attention_with_output` path (the same path this file already uses for
+every token except small pure-decode batches, and the only path ever actually reachable
+on ROCm today, since `self.flint_decode` is already always False there) -- without
+touching Flint's CUDA/SM100 fast paths at all.
+
+Context, as unverified claims to confirm (not established facts):
+
+IMAGE={{image}} CONSTRAINTS={{constraints}} -- resolve `<IMAGE>`/`<CONSTRAINTS>` in the
+context below to these values.
+
+{{known_context}}
+
+Scope and exclusions: {{constraints}}
+
+How to verify you are running from your own edited vllm worktree inside the container:
+
+IMAGE={{image}} -- resolve `<IMAGE>` in the notes below to this value.
+
+{{editable_mode_notes}}
+
+Environment: use the local docker image `{{image}}` (already present locally; do not
+pull). Resolve the vllm rig's source repository and tip-of-tree commit using `gc rig
+list --json` (registered path hint: {{repo_path}}); do not assume this hint is accurate
+without verifying it against the rig registration. The Flint checkpoint is already
+downloaded at {{model_path}}; do not re-download it.
+
+IMAGE={{image}} -- resolve `<IMAGE>` in the rules below to this value.
+
+{{gpu_rules}}
+
+Additional focus or hints: {{question}}
+
+Diagnose and design only; do not implement the production fix in this step. If you need
+to read source or run a quick experiment, use your own isolated worktree (never the
+shared vllm checkout) at
+`~/dev/cities/gc-worktrees/vllm/{{formula_id}}/investigate/<claimed-bead-id>` on branch
+`{{formula_id}}/investigate/<claimed-bead-id>`, per your pack's worktree protocol.
+Concretely:
+
+- Reproduce the baseline crash fresh: launch `vllm serve {{model_path}}
+  --tensor-parallel-size=1` with `VLLM_ROCM_USE_AITER=1` against the unmodified image on
+  an idle GPU, and confirm the exact `ModuleNotFoundError` signature from
+  {{known_context}} point 1 recurs verbatim (file:line, full traceback) -- do not
+  assume it from the supplied context without seeing it yourself in this environment.
+- Read `vllm/models/flint/model.py`'s `FlintAttention.__init__` and `forward` in full,
+  and confirm or refute {{known_context}} point 4's claim that `self._metadata_cls`,
+  `self._decode_cls`, and `self.impl` are read only inside methods gated by
+  `self.flint_decode` (`_decode_plan`, `_run_decode_attention`) -- search the entire
+  class (and any subclass/caller) for every read of these three attributes, not just
+  the obvious ones, before concluding it is safe to skip their FlashInfer-specific
+  setup when FlashInfer is unavailable.
+- Confirm {{known_context}} point 4's claim that `self.flint_decode` (from
+  `_flint_kernels(quant_config)`, gated on `current_platform.is_device_capability_family(100)`)
+  is unconditionally False on this ROCm/gfx942 host, i.e. the FlashInfer-specific
+  decode fast path this import serves is already dead code here at runtime.
+- Read `vllm/model_executor/layers/attention/attention.py`'s `Attention.__init__` /
+  `get_attn_backend()` resolution and `unified_attention_with_output` to confirm the
+  generic path Flint already calls for prefill/non-fast-path decode works with
+  whatever backend ROCm resolves to (confirmed in {{known_context}} point 3 as
+  ROCM_AITER_FA for this hardware/config) with no Flint-specific wiring beyond what
+  `self.attn` (a standard `Attention` layer) already provides.
+- Check every other file under `vllm/models/flint/` (configs.py, __init__.py,
+  gguf_nvfp4.py, and everything under ops/) for similar unconditional CUDA/FlashInfer/
+  SM100-only imports or assumptions (per {{known_context}} point 5) that would also
+  need to be made conditional or confirmed already-lazy/already-guarded, and report
+  precisely which files are and are not affected -- do not assume model.py's
+  FlashInfer import is the only blocker without checking.
+- Design the smallest change that lets `FlintAttention.__init__` construct
+  successfully when FlashInfer is unavailable (e.g. gate the import/assertion/
+  `_metadata_cls`/`_decode_cls` setup behind a `try/except ImportError` or an explicit
+  platform/capability check, setting `self.flint_decode` and any flashinfer-dependent
+  state consistently so `forward()`'s existing generic path is the only one ever
+  reached), identifying every file and function that needs to change.
+- Flag explicitly if any part of a viable fix would require more than this (e.g. a
+  genuinely different code path for correctness, not just construction) -- record it
+  precisely rather than assuming the minimal gating change is sufficient without
+  reasoning through `forward()`'s actual control flow.
+
+Use `{{artifact_dir}}` as the shared directory for this run. Write your artifacts under
+`{{artifact_dir}}/investigate/`, creating that subdirectory if needed; it must not
+contain an earlier run's reports. Do not overwrite existing files.
+
+Before closing this step, write `{{artifact_dir}}/investigate/investigation.md` with:
+- Your claimed bead ID, the vllm tip-of-tree commit used, image used, GPU index, and
+  date.
+- The exact reproduction command, container name/flags, GPU index, environment
+  variables, versions; mark missing information.
+- Fresh findings with file:line references and raw output paths. Separate fresh
+  observations from the supplied context and from untested hypotheses.
+- A definitive, evidence-backed answer to: is a generic-attention-fallback fix viable
+  for making Flint constructible and servable on ROCm, given what actually reads
+  `self._metadata_cls`/`self._decode_cls`/`self.impl`/`self.flint_decode`? If not
+  viable as scoped, say exactly why (e.g. a genuine correctness dependency on
+  FlashInfer-specific behavior beyond just construction).
+- A minimal experiment plan for the experimenter: hypothesis, prediction, control,
+  exact commands, distinguishing result -- including a plan to reach an actual served
+  query response, not just successful model construction.
+- Explicit confirmation of what is and is not in scope per {{constraints}}.
+
+Append the handoff summary and absolute report path to this claimed step's notes with
+`gc bd update <claimed-bead-id> --append-notes <text>` and record
+`--set-metadata investigation.report_path=<path>`. Verify the report is readable, then
+set `gc.outcome=pass` on this claimed step and close only it.
+
+If blocked (image missing, no idle GPU, cannot produce a usable handoff), append the
+reason, set `gc.outcome=fail` and `gc.failure_reason=<reason>`, and close only this
+step. Do not close the workflow root.
+"""
+
+[[steps]]
+id = "experiment"
+title = "Validate the generic-attention-fallback candidate fix for Flint on ROCm"
+needs = ["investigate"]
+metadata = { "gc.run_target" = "vllm/experimentation.experimenter", "gc.scope_ref" = "body", "gc.scope_role" = "member", "gc.on_fail" = "abort_scope" }
+description = """
+Read `{{artifact_dir}}/investigate/investigation.md` before running anything. Read the
+producer bead ID recorded in it, and verify it belongs to the same `gc.root_bead_id` as
+your claimed step and has `gc.outcome=pass`. Test environment: docker image
+`{{image}}`.
+
+Scope and exclusions: {{constraints}}
+
+IMAGE={{image}} -- resolve `<IMAGE>` in the rules below to this value.
+
+{{gpu_rules}}
+
+Additional focus or hints: {{question}}
+
+Use a worktree at
+`~/dev/cities/gc-worktrees/vllm/{{formula_id}}/experiment/<claimed-bead-id>` on branch
+`{{formula_id}}/experiment/<claimed-bead-id>`, per your pack's worktree protocol.
+
+Test the handoff's hypotheses; do not assume its conclusions are correct, including
+whether gating the FlashInfer import/assertion is genuinely sufficient -- re-derive the
+change yourself and confirm it against a real run, not just against the investigation's
+description of it. Follow your six-step protocol for every experiment: hypothesis,
+prediction (recorded before running), exact command/environment, run, actual result,
+verdict (supports / contradicts / inconclusive). Prefer the smallest experiments that
+separate the hypotheses, for example:
+
+- Confirm the baseline crash reproduces fresh in your own environment (do not reuse the
+  investigation step's raw logs as your own evidence) by launching `vllm serve
+  {{model_path}} --tensor-parallel-size=1` with `VLLM_ROCM_USE_AITER=1` against the
+  unmodified image.
+- Implement the investigation's candidate change (gating the FlashInfer-specific setup
+  in `FlintAttention.__init__`) in your experiment worktree, bind-mounted read-write
+  over /root/dev/vllm, and confirm the change is actually in effect
+  (`vllm.__file__`/git HEAD per {{editable_mode_notes}}) before trusting any result.
+- Re-launch the same `vllm serve` command with the candidate change applied and confirm
+  the engine actually starts and becomes HTTP-ready (not just that the specific
+  exception disappears -- check for any new failure further along, e.g. during
+  warmup/profiling/CUDA-graph-capture-equivalent steps, or at first-request time).
+- Send a real chat completion request against {{model_path}} once the server is ready,
+  and confirm the response content looks correct/sane (not just "a response came
+  back") -- spot-check against a simple, verifiable prompt.
+- If the investigation found other affected files (per {{known_context}} point 5),
+  confirm whether they actually need a code change here or were already fine, and
+  report which.
+- Confirm no regression to Flint's CUDA-path-reachable code: this host cannot build
+  the cutlass/cute/quack kernels, so a full CUDA-path functional test is not possible
+  here -- instead, statically confirm (e.g. via `python3 -c "import ast; ..."` or a
+  careful read) that the FlashInfer/SM100-only code paths are still reached under
+  exactly the same conditions as before your change (i.e. your change only ADDS a
+  fallback for when those conditions are false/unavailable, it does not alter
+  behavior when they are true) -- report this as a static, not a dynamic, check.
+- As a stronger end-to-end check, attempt the downstream llm-bench-runner recipe (per
+  {{known_context}} point 6): from /home/ryrock/dev/llm-bench-runner, `uv run launch
+  --config-file=recipes/flint/topk-gating/server.yaml --warmup --collect-metrics
+  --dataset=random --max-concurrency 8 --random.input_len=64 --random.output_len=32
+  --num-prompts=16 --experiment-name=<your-bead-id>-flint-rocm-check
+  --server.image={{image}} --server.tensor_parallel_size=1` (adjust flags as needed;
+  read that tool's CLI help/examples if unsure) bind-mounting/building against your
+  experiment worktree's fix, and confirm it reaches a real served response -- this is
+  optional but strongly recommended since it mirrors the actual downstream consumer;
+  if impractical in this step, leave it to the implement step instead and say so.
+
+Save experiment records and raw output under `{{artifact_dir}}/experiment/` (creating
+it if needed) and write `{{artifact_dir}}/experiment/experiments.md` with the producer
+bead ID, every experiment's six steps, evidence paths, verdicts, uncertainties, and a
+recommended fix direction naming the exact vllm source file(s)/function(s), the change,
+and the tested revision -- or, if the hypothesis is refuted, a clear statement of why a
+generic-attention-fallback fix is not viable and what would be needed instead. Do not
+implement the production fix in the shared vllm checkout; candidate edits belong only
+in your own experiment worktree.
+
+Append the summary and absolute artifact paths to this claimed step's notes with `gc bd
+update <claimed-bead-id> --append-notes <text>`, set `experiment.report_path=<path>`
+and `gc.outcome=pass`, and close only this step. `pass` means the experiments were
+completed, even if the hypothesis is contradicted or inconclusive.
+
+If the handoff is missing, stale, or unusable, or runtime resources prevent execution,
+record the blocker, set `gc.outcome=fail` and `gc.failure_reason=<reason>`, and close
+only this step. Do not fabricate results or close earlier steps or the workflow root.
+"""
+
+[[steps]]
+id = "implement"
+title = "Implement, validate, and commit the Flint-on-ROCm attention fix, if the experiments support it"
+needs = ["experiment"]
+metadata = { "gc.run_target" = "vllm/implementation.implementer", "gc.scope_ref" = "body", "gc.scope_role" = "member", "gc.on_fail" = "abort_scope" }
+description = """
+Read `{{artifact_dir}}/experiment/experiments.md`, the producer experiment bead, and
+the investigation artifacts it cites. Verify the investigation and experiment step
+beads belong to your `gc.root_bead_id`, completed with `gc.outcome=pass`, and recorded
+the report paths you are reading; record their IDs and paths on your claimed step.
+
+If the experiments concluded a generic-attention-fallback fix is NOT viable (e.g. it
+genuinely requires FlashInfer-specific behavior beyond construction, or some other
+blocker that cannot be resolved within {{constraints}}), write the report documenting
+that conclusion and the evidence for it, set `gc.outcome=pass`, and close only your
+step -- do not proceed with the remaining implementation instructions below. Recommend
+a specific alternative direction (e.g. a ROCm-native reimplementation of the
+FlashInfer-specific decode fast path, or marking Flint as CUDA-only with a clear
+error message instead of a confusing ModuleNotFoundError) for a human or follow-up
+formula to pick up, rather than implementing it yourself.
+
+If the experiments did validate a fix, additional scope and resource constraints:
+{{constraints}}
+
+IMAGE={{image}} -- resolve `<IMAGE>` in the rules below to this value.
+
+{{gpu_rules}}
+
+Choose the smallest coherent fix supported by the experiments' winning candidate,
+touching only `vllm/models/flint/` (and, if the experiments found it necessary,
+`vllm/v1/attention/backends/flashinfer.py` or `vllm/utils/flashinfer.py` -- do not
+assume `vllm/models/flint/model.py` is the only file without checking what the
+experiments actually validated). Resolve the vllm rig's authoritative path via `gc rig
+list --json` (registered path hint: {{repo_path}}); do not assume the hint is accurate
+without verifying it. Optional base-ref override: {{base_ref}}; if empty, use the vllm
+rig's tip-of-tree default branch.
+
+Follow your worktree protocol. Record the shared vllm checkout's dirty state,
+branch/HEAD, and protected main/default-branch refs. Create/recover the linked
+worktree `~/dev/cities/gc-worktrees/vllm/{{formula_id}}/implement/<claimed-bead-id>` on
+branch `{{formula_id}}/implement/<claimed-bead-id>`, verifying repository, path,
+ownership, and branch before any edit. Save its absolute path as `work_dir` and record
+`implementation.worktree_path`, `implementation.branch`, and
+`implementation.base_commit`. All edits, builds, tests, staging, and commits happen
+there. Never modify the shared vllm checkout, never advance main, never edit the
+docker image.
+
+Implement the fix with focused regression coverage (e.g. a test confirming
+`FlintAttention` constructs successfully and dispatches through
+`unified_attention_with_output` when FlashInfer is unavailable/the platform is not
+SM100, alongside confirmation -- static if a dynamic CUDA run is not possible on this
+host -- that the existing FlashInfer/SM100 code path is unchanged when those
+conditions hold). Validate by bind-mounting YOUR implementation worktree read-write
+over /root/dev/vllm inside a container from `{{image}}` (confirm genuine editable mode
+per {{editable_mode_notes}} before trusting any result):
+1. The original baseline crash (fresh reproduction against the unmodified image before
+   your fix is applied in the worktree).
+2. `vllm serve {{model_path}} --tensor-parallel-size=1` with `VLLM_ROCM_USE_AITER=1`
+   now reaches HTTP-ready and serves a real, correct-looking chat completion response
+   -- this is the primary success criterion for this entire workflow.
+3. The downstream llm-bench-runner recipe (per {{known_context}} point 6): from
+   /home/ryrock/dev/llm-bench-runner, run `uv run launch
+   --config-file=recipes/flint/topk-gating/server.yaml --warmup --collect-metrics
+   --dataset=random --max-concurrency 8 --random.input_len=64 --random.output_len=32
+   --num-prompts=16 --experiment-name=<your-bead-id>-flint-rocm-fix
+   --server.image=<your fix's image/overlay> --server.tensor_parallel_size=1` (adjust
+   as needed) to confirm the actual downstream consumer this blocker was preventing
+   now works end-to-end. If you need a docker image carrying your committed fix
+   rather than a bind mount for this step (since llm-bench-runner's own server
+   launch does not bind-mount a worktree), build a small overlay image (`FROM
+   {{image}}` + `COPY`/`git apply` your fix's diff onto /root/dev/vllm, mirroring the
+   overlay-image pattern already used elsewhere in this project) and point
+   `--server.image` at that -- do not use a raw, unexplained `docker run` for the
+   actual serve/benchmark traffic itself; `uv run launch` is llm-bench-runner's own
+   launch mechanism and should be used for this validation.
+4. No regression in Flint's existing test suite that is actually runnable on this
+   host (tests/models/flint/*.py); report plainly which of these could not be run
+   here (likely most, since they exercise CUDA/SM100-only cutlass/cute/quack kernels)
+   and why, rather than fabricating a result.
+5. The repository's required lint/pre-commit hooks on changed files.
+Report which results are proxy-only and what remains untested.
+
+After validation passes, recheck the worktree and branch, stage only intended files by
+explicit path, inspect the staged diff, run `git diff --cached --check`, and commit on
+`{{formula_id}}/implement/<claimed-bead-id>` following the vllm repository's
+commit/DCO/hook rules. Never bypass failing hooks. Record the full commit hash as
+`implementation.commit_hash`. Do not merge, push, or open a PR.
+
+Use `{{artifact_dir}}/implement/` for this run's artifacts (creating it if needed).
+Write `{{artifact_dir}}/implement/implementation.md` (source/producer IDs, fix and
+rationale, worktree/branch/base/fix commits, the editable-mode verification used for
+validation, validation commands and results -- including the final working `vllm
+serve` command and its actual response, and the llm-bench-runner validation outcome --
+limitations, artifact paths) and export `{{artifact_dir}}/implement/implementation.patch`
+with `git diff --binary <base-commit> <fix-commit>`. Append the summary and paths to
+your claimed bead, set `implementation.report_path`, `implementation.patch_path`,
+`implementation.commit_hash`, and `gc.outcome=pass`, then close only your step.
+
+If no justified fix exists, required validation is unavailable, or committing fails,
+write a partial report with blockers, preserve worktree progress, set `gc.outcome=fail`
+and `gc.failure_reason`, and close only your step. Do not close earlier steps or the
+workflow root.
+"""
