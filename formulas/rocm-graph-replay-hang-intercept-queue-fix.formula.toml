@@ -1,0 +1,413 @@
+formula = "rocm-graph-replay-hang-intercept-queue-fix"
+version = 1
+description = """\
+Implement and validate a fix for the ROCm CUDA-graph-replay hang that the investigate -> experiment \
+formula rocm-graph-replay-hang-intercept-forwarding-trace established (root rs-0s6; investigation \
+rs-9h2; experiment rs-pgr; run directory run.BKepy2). The hang is a lost wake-up in ROCr's \
+InterceptQueue retry hand-off: the retry handler finds the wrapped hardware ring full with no retry \
+barrier armed and no later doorbell to re-run the forwarding loop, so packets stranded in overflow_ \
+never reach the hardware queue. The stuck host blocks in HIP's WaitForQueueSlot (or in \
+torch.cuda.synchronize), its GPU reads 0 %, and the peers spin in the custom all-reduce. The fix \
+changes only ROCr's slot accounting and retry logic at base 25e14349f26 (the commit image A's runtime \
+was built from). It must be proven on a host-side model check and unit tests, then validated on a \
+derived image on a GPU node against a faithful rebuild with interleaved trials and a performance \
+check. Done = a committed patch on a worktree branch with its validation report. Nothing is pushed, \
+merged, or sent upstream."""
+
+[requires]
+formula_compiler = ">=2.0.0"
+
+[vars.formula_id]
+description = "Run identifier used to label this run's worktree directories and branches."
+default = "rocm-graph-replay-hang-intercept-queue-fix"
+pattern = "^[A-Za-z0-9_.-]+$"
+
+[vars.artifact_dir]
+description = "Absolute, shared artifact directory, unique to this workflow run."
+required = true
+pattern = "^/"
+
+[vars.producer_root_bead]
+description = "Root bead of the investigate -> experiment formula that produced the findings."
+default = "rs-0s6"
+
+[vars.investigation_bead]
+description = "Investigation step bead (producer of investigation.md). Must have gc.outcome=pass."
+default = "rs-9h2"
+
+[vars.experiment_bead]
+description = "Experiment step bead (producer of experiments.md). Must have gc.outcome=pass."
+default = "rs-pgr"
+
+[vars.investigation_report]
+description = "Absolute path to the investigation report: source-level account of the forwarding, retry and wake-up path, candidate races, rebuild recipe."
+default = "/home/ryrock/dev/cities/runs/rocm-graph-replay-hang-intercept-forwarding-trace/run.BKepy2/investigate/investigation.md"
+pattern = "^(/.*)?$"
+
+[vars.experiment_report]
+description = "Absolute path to the experiment report: fidelity, perturbation and causal tables, verdict."
+default = "/home/ryrock/dev/cities/runs/rocm-graph-replay-hang-intercept-forwarding-trace/run.BKepy2/experiment/experiments.md"
+pattern = "^(/.*)?$"
+
+[vars.experiment_records]
+description = "Absolute path to the experiment's per-experiment records directory. E4-causal.md has the causal table; E3-hang-stories/ has the classified hang timelines."
+default = "/home/ryrock/dev/cities/runs/rocm-graph-replay-hang-intercept-forwarding-trace/run.BKepy2/experiment/records"
+pattern = "^(/.*)?$"
+
+[vars.harness_dir]
+description = "Absolute path to the experiment's trial harness (run_blocks.py, rspgr.py, analyze.py, arms JSON files). Copy it into the artifact directory before use; do not edit the copy that bind-mounted trials use."
+default = "/home/ryrock/dev/cities/runs/rocm-graph-replay-hang-intercept-forwarding-trace/run.BKepy2/experiment/scripts"
+pattern = "^(/.*)?$"
+
+[vars.rocm_systems_path]
+description = "Path of the rocm-systems rig (registered name rocm-systems, default branch develop). Resolve it with `gc rig list --json` from the city root before use; the path below is a hint."
+default = "/home/ryrock/dev/rocm-systems"
+pattern = "^(/.*)?$"
+
+[vars.base_commit]
+description = """\
+rocm-systems commit the fix is built on: image A's ROCr runtime pin. It is NOT an ancestor of \
+rocm-systems develop (it is the tip of an unmerged development branch), so do not base the fix on \
+develop without a separate port step."""
+default = "25e14349f2606a6b95c4ccd45eb92a1835646cf2"
+pattern = "^[0-9a-f]{40}$"
+
+[vars.node]
+description = "GPU node for the derived-image build and validation trials (8x AMD Instinct MI300X, gfx942). Confirm architecture and free GPUs before use; it is shared."
+default = "s73"
+
+[vars.node_notes]
+description = "Node facts from the experiment. Slurm partition wally, GPU gres mi300x:8. The experiment held s73 with `salloc --gres=gpu:mi300x:8 -w s73 --no-shell -t <limit> -J <bead>`. Use another node only with the user's approval."
+default = "Slurm partition wally; GPU gres mi300x:8; s73 used by the experiment (E4 ran there). Re-verify with `scontrol show node` and `sacct -N <node>` before allocating."
+
+[vars.image_a]
+description = "Image A, the original vLLM ROCm image with the custom ROCr/HIP runtime (rocm-systems 25e14349f26). Pull by digest only if absent on the node."
+default = "vllm/vllm-openai-rocm@sha256:2358d61b70974b700b74635953a9ab4646efa39d569ecc5c1eb1d5ab760c3466"
+
+[vars.builder_image]
+description = "Builder image with the ROCm toolchain and a /src checkout, used to compile the runtime. Reuse it if the node has it; otherwise build it as the investigate step did (see investigation.md, rebuild recipe)."
+default = "local/rocm-graph-replay-hang-intercept-forwarding-trace:a-rebuild-builder"
+
+[vars.control_image]
+description = "Faithful control: image A's runtime rebuilt from the base commit with NO patch (tag a-rebuilt in the experiment). Hangs at the same rate as image A (E1: 22/100 vs 25/100)."
+default = "local/rocm-graph-replay-hang-intercept-forwarding-trace:a-rebuilt"
+
+[vars.variant_dockerfile]
+description = "Dockerfile that turns image A into a derived image with rebuilt libraries. Build with --build-arg BASE_IMAGE=<image A> --build-arg VARIANT=<variant>, from an empty context holding staging/ and unstripped/."
+default = '''# Derived runtime image: image A with rebuilt ROCr libraries installed the way image A's own
+# build installs them (COPY of the staged libs, hard-link block, ldconfig).
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+ARG VARIANT=unset
+ARG ROCM_RUNTIME_COMMIT=25e14349f2606a6b95c4ccd45eb92a1835646cf2
+COPY staging/lib/ ${SDK_DEV}/lib/
+RUN set -eux; \
+    cd "$SDK_DEV/lib"; \
+    ours_hsa="$(readlink -f libhsa-runtime64.so.1)"; \
+    ours_hip="$(readlink -f libamdhip64.so.7)"; \
+    for f in "$SDK_DEV"/lib/libhsa-runtime64.so.1* "$SDK_CORE"/lib/libhsa-runtime64.so.1* \
+             "$SDK_DEV"/lib/libamdhip64.so.7* "$SDK_CORE"/lib/libamdhip64.so.7*; do \
+        [ -f "$f" ] && [ ! -L "$f" ] || continue; \
+        case "${f##*/}" in libhsa*) ours="$ours_hsa";; *) ours="$ours_hip";; esac; \
+        [ "$f" -ef "$ours" ] || ln -f "$ours" "$f"; \
+    done
+RUN ldconfig
+COPY unstripped/ /opt/rs9h2/symbols/
+LABEL ai.rspgr.variant="${VARIANT}" ai.rs9h2.rocm-systems-commit="${ROCM_RUNTIME_COMMIT}"
+'''
+
+[vars.known_context]
+description = "Findings from the investigate -> experiment formula. Confirm what the fix depends on; these are leads with evidence, not conclusions to copy."
+default = '''1. THE SYMPTOM. A vLLM ROCm CUDA-graph replay hang. One or more ranks' host threads block
+forever (in HIP's WaitForQueueSlot, or in torch.cuda.synchronize). Their GPU reads 0 %. The peer
+GPUs read ~100 % because they spin in the custom all-reduce on a flag the stuck rank never writes.
+Nothing is printed and the process never exits.
+
+2. THE POLLED RING IS A ROCr INTERCEPT PROXY. HIP's VirtualGPU::WaitForQueueSlot polls the read index
+of the proxy ring of a ROCr InterceptQueue (libhsa-runtime64). The proxy exists because torch
+registers a rocprofiler-sdk tool and ROCPROFILER_QUEUE_INTERPOSITION=0 selects the non-inline path.
+ROCPROFILER_REGISTER_ENABLED=0 removes the proxy, and no hang occurred in that arm. The read index
+of the proxy is stored in one place, the end of InterceptQueue::StoreRelaxed (base 25e14349f26:
+projects/rocr-runtime/runtime/hsa-runtime/core/runtime/intercept_queue.cpp, function about lines
+329-432, store about line 431). StoreRelaxed runs in the thread that rings HIP's doorbell, or on the
+async-events thread in HandleRetryDoorbell (about lines 191-203). Submit (about lines 230-327)
+stashes what the wrapped hardware ring cannot take in overflow_ and arms a retry barrier only if the
+plan allows it:
+  insert_retry_barrier = submitted_count < non_marker && !pending_retry_point && free_slots >= 1
+  (core/inc/intercept_queue_logic.h, lines 60-61)
+While a retry is pending, PlanSubmit keeps no slot free: reserve = pending_retry_point ? 0 : 1
+(line 39), and the out-of-space branch at lines 41-49 also drops the reserve when pending. Every
+StoreRelaxed that cannot drain overflow_ returns before the read-index store.
+
+3. THE RACE, IN EVENT ORDER. A short retry cycle (barrier armed behind a few hundred packets, done in
+1-2.5 ms while HIP is still pushing). HIP's doorbells while the retry is pending top the wrapped ring
+up to full, because pending keeps no slot free. The CP consumes the barrier and its completion signal
+fires. The async thread runs RETRY_FIRE and RETRY_CLEARED, then its plan sees free_slots = 0 with
+pending = 0. It submits nothing, arms nothing, retry_outstanding_ = 0, and overflow_ (150-160
+packets) is stranded. The hardware ring drains and the GPU idles. HIP has no doorbell left: it is
+blocked in WaitForQueueSlot on the same read index, or it has finished its launches and is waiting in
+torch.cuda.synchronize. Two ways reach free_slots = 0 at the handler:
+  R1 (10 of 13 classified stuck ranks): top-ups ran after the barrier slot was already consumed.
+  R4 (3 of 13): the wrapped read index still lags the barrier whose signal had already fired.
+Clean runs strand the same way (18 handler strands in 200 traced trials) and heal when a later doorbell,
+tens of microseconds on, finds a free slot.
+
+4. EVIDENCE (GPUs 0-3, n = 100 unless noted; Wilson 95 % CI; two-sided Fisher p vs the contemporaneous
+control):
+  - E1 fidelity: the faithful rebuild hangs like image A, 22/100 vs 25/100, p = 0.74.
+  - E2: recording the full event stream removed the hang, 0/100 vs 19/100. Light masks did not.
+  - E3: 14/14 single-stuck-rank hangs with a registry were in the lost-wake-up state. Ringing the stuck
+    rank's proxy doorbell from outside recovered 16/16 hung processes within 1 s.
+  - E4 causal, control K0 (a-knobs, knobs off) 18/100; control R (a-rebuilt) 19/99:
+      RP   (ROCPROFILER_REGISTER_ENABLED=0, no proxy):              0/100, p = 6.6e-7
+      Kres (RSPGR_RESERVE_SLOT=1: keep one slot free while a retry is pending): 0/100, p = 3.3e-6
+      Kkick (HIP re-rings its doorbell from the wait loop):          0/100, p = 3.3e-6
+      Khold (RSPGR_HOLD_US=2000: handler runs right after HIP's last doorbell): 85/99, p = 3.6e-23
+      KholdRes (Khold with the slot kept):                          0/100, p = 3.3e-6
+      Knap0 (no async-loop nap, busy re-scan):                      4/99, p = 0.0026
+  - The Kres build changed the submit plan in about 725k of 728k pending-retry plans (counter table in
+    E4-causal.md). Its clean wall-clock median was the same as K0's (20.0 s).
+  Khold shows that a handler that runs at the wrong moment strands; Knap0 shows that a faster
+  handler alone does not close the window; Kres and Kkick show that either keeping a slot or ringing
+  the doorbell closes it.
+
+5. GAPS THE FIX MUST CLOSE (analysis, NOT yet verified; the implementer decides with the model check
+below). Kres keeps a spare slot only while a retry is pending. Insertion of the barrier needs only
+free_slots >= 1 and takes that slot. So a barrier inserted into the last free slot leaves the ring
+full with the barrier as its final packet. If R4 then applies (the read index lags the barrier's
+signal), the handler still sees free_slots = 0 and strands. Kres's 0/100 is an empirical result, not
+an invariant. The question for the fix is which rule makes this impossible: for example, insert the
+barrier only when at least two slots are free, so one stays free after it lands, or keep a spare
+in every state with overflow_ non-empty.
+
+6. EXISTING TESTS AT THE BASE. projects/rocr-runtime/rocrtst/suites/functional/intercept_queue/
+intercept_queue_logic_test.cc (about 130 lines, nine PlanSubmit tests, including
+InvariantsHoldOverManySnapshots and PendingBarrierNeverInsertsAnother) tests the pure logic
+header. It does NOT test the handler's view after a retry clears, and it does not test liveness.
+The fix must keep those tests passing and add the cases that express the invariant.
+
+7. WHAT IS NOT SHOWN. The mechanism is shown for the single-stuck-rank hang in the repro (TP=4,
+GPUs 0-3, a 4-GPU set). Image B (the stock runtime) is NOT shown to share it. The full decode64k bench
+(TP=8) hangs at 65/100 on image A and was not used in the experiment's causal tests. rocprofiler-sdk
+has its own intercept_queue.cpp (projects/rocprofiler/src/core). The experiment located the mechanism
+in ROCr's InterceptQueue (libhsa-runtime64), not in that file.'''
+
+[vars.gpu_rules]
+description = "Rules for using the GPU node safely. The node is shared."
+default = '''GPU RULES. The node is shared; other users may keep containers there and run GPU work in or
+outside Slurm. Run docker and Slurm commands on the node itself (ssh first if it is not the local host).
+1. Allocation. If Slurm manages the node, hold ONE allocation of all 8 GPUs for the whole measurement:
+   `salloc --gres=gpu:mi300x:8 -w <node> --no-shell -t <limit> -J <claimed bead id>`, then confirm
+   with `scontrol show job -d` that you hold GPU indices 0-7. Confirm with `rocm-smi --showuse`,
+   `--showmeminfo vram` and `--showpidgpus` that no foreign process holds any GPU, and recheck before
+   every trial. If a foreign process appears, stop after the in-flight trial and record a BLOCKER.
+   Do not resume until the blocker is cleared or the user approves. Never run on GPUs someone else
+   holds, and never touch another user's jobs, containers or images. `scancel` your allocation when done.
+2. Scheduled work. Before allocating, check `sacct -N <node> -S <a week back> -X`, `squeue -w <node>`,
+   and the node notes. End the allocation before any scheduled GPU job or image build you find.
+3. Images. Never retag, overwrite, push or remove an image you did not create. Never run
+   `docker system prune` or `docker builder prune`. Check free space on docker's data root before a
+   build and stop if it would fall below about 60 GB. Derived images are tagged
+   `local/<formula id>:<variant>`, and the staged libraries' sha256 is recorded for each.
+4. Containers. Base flags: `--device=/dev/kfd --device=/dev/dri --group-add=video
+   --security-opt=seccomp=unconfined --cap-add=SYS_PTRACE --ipc=host --ulimit=memlock=-1:-1
+   --entrypoint=bash -e HIP_VISIBLE_DEVICES=<GPU list> --shm-size=16g`. Name each container with your
+   claimed bead ID plus the arm and trial number, use one fresh container per trial, and `docker rm -f`
+   on every exit path. Never bind-mount over vLLM, AITER, torch or ROCm files in a running trial.
+5. Timeouts and hang capture. Give every trial a wall-clock timeout of about 2x the slowest clean trial
+   of the same arm, measured on the first trials. Before removing a hung trial, capture
+   `py-spy dump --native --locals` for every rank, `rocm-smi --showuse` and `--showpidgpus`, each rank's
+   last loop index, and the container log. Map ranks to PIDs and GPUs carefully.
+6. Loops. Run trial loops detached (setsid/nohup). Monitor with checks that cannot match themselves
+   (`test -f`, a tally file, `pgrep -f '[l]oop_name'`), never a plain `pgrep -f <name>`. Avoid
+   `pkill -f` for the same reason. Check free disk space periodically.
+7. Host. Do not change host sysctls, kernel modules, driver parameters, or anything outside your
+   containers and your own files.'''
+
+[vars.constraints]
+description = "Scope, out-of-scope items, success criterion, and what may not be done."
+default = '''SCOPE. The fix changes ROCr's InterceptQueue slot accounting and retry hand-off only:
+projects/rocr-runtime/runtime/hsa-runtime/core/inc/intercept_queue_logic.h and, only if the call
+site needs it, core/runtime/intercept_queue.cpp (plus the unit-test file). Out of scope: changing
+rocprofiler-sdk, HIP/CLR, the wait loop in WaitForQueueSlot, the trace or knob code of the experiment,
+and the image-B (stock runtime) mechanism. If the correct fix needs a change outside ROCr's
+intercept queue, stop and report it instead of making it.
+
+DIAGNOSTIC CODE STAYS OUT. The experiment's RSPGR knobs, trace records, and stall-injection hooks must
+not appear in the fix commit. Build a separate, uncommitted variant for the stress test.
+
+SUCCESS CRITERION (all of these, with numbers):
+ (a) The model check in step C finds no reachable liveness violation under the fix, and the base code
+     has a counterexample that matches R1 or R4.
+ (b) The derived image with the fix shows 0 hangs in the trials-per-arm count set in the step (200
+     by default) on GPUs 0-3, while the faithful control in the same interleaved blocks hangs at a
+     rate whose Fisher two-sided p against the fix is below 0.001. Report the Wilson 95 % CI for both.
+ (c) No performance regression: clean-trial median wall-clock and per-replay event time for the fix
+     are within 2 % of the control's, with a Mann-Whitney p reported.
+ (d) Existing and new host unit tests pass.
+
+MAY NOT: push, merge, open a PR, rebase or amend shared history, bypass commit hooks, edit the shared
+rocm-systems checkout (work only in the worktree), or change the images you did not create.
+Use the commit attribution line required by this workflow in the commit message.'''
+
+[vars.trials_per_arm]
+description = "Trials per arm for the fidelity and fix comparison on GPUs 0-3. 0/200 gives a 95 % upper bound of 1.8 %."
+default = "200"
+
+[vars.time_budget_hours]
+description = "Upper bound on node time for the validation, in hours. Plan trial counts to fit; if the budget runs out, stop after a complete block of arms and report counts."
+default = "12"
+
+[vars.question]
+description = "Optional extra focus or hints."
+default = ""
+
+[[steps]]
+id = "body"
+title = "Implement and validate a fix for the lost wake-up in ROCr's InterceptQueue retry hand-off"
+needs = ["implement"]
+metadata = { "gc.kind" = "scope", "gc.scope_name" = "rocm-graph-replay-hang-intercept-queue-fix", "gc.scope_role" = "body" }
+
+[[steps]]
+id = "implement"
+title = "Implement, model-check, build, validate on GPUs, and commit a fix for the InterceptQueue lost wake-up"
+needs = []
+metadata = { "gc.run_target" = "rocm-systems/implementation.implementer", "gc.scope_ref" = "body", "gc.scope_role" = "member", "gc.on_fail" = "abort_scope" }
+description = """
+Goal: a committed, validated ROCr fix for the lost wake-up described in known_context, on a worktree
+branch of the rocm-systems rig, with a report. Do not rediscover the mechanism: the investigation
+and experiment established it. Do re-check the code and the leads against the base commit, and
+treat known_context as hypotheses with evidence.
+
+PRODUCER BEADS. Before anything else, run `gc bd show {{investigation_bead}}` and
+`gc bd show {{experiment_bead}}` from the city root (/home/ryrock/dev/cities/gc-vllm; `gc bd` fails
+elsewhere). Each must have gc.root_bead_id {{producer_root_bead}} and gc.outcome=pass. Check that
+their report-path metadata matches {{investigation_report}} and {{experiment_report}}. If a producer
+is missing, stale, or not passed, record the blocker, set gc.outcome=fail and gc.failure_reason, and
+close only this step.
+
+RIG AND NODE. Node: {{node}}. Image A: {{image_a}}. Builder: {{builder_image}}. Control image: {{control_image}}.
+NODE NOTES: {{node_notes}}
+{{gpu_rules}}
+
+Additional focus or hints: {{question}}
+{{constraints}}
+
+Background (known_context; verify before relying on it):
+{{known_context}}
+
+Read {{investigation_report}} and {{experiment_report}} in full before running anything. Then read
+{{experiment_records}}/E4-causal.md for the exact arm commands and counters. Copy {{harness_dir}}
+into {{artifact_dir}}/implement/harness/ and work from the copy.
+
+Source rules. Resolve {{rocm_systems_path}} with `gc rig list --json`. Confirm the base commit with
+`git -C <rig> cat-file -t {{base_commit}}`. Record the rig's dirty state: it has uncommitted
+.gitignore changes and untracked .agents/, .claude/, .gc/. Do not touch them. Create the worktree
+`~/dev/cities/gc-worktrees/rocm-systems/{{formula_id}}/implement/<claimed-bead-id>` on branch
+`{{formula_id}}/implement/<claimed-bead-id>` from {{base_commit}}, verifying the repository, path and
+branch before any edit. Record it as implementation.worktree_path and the base as
+implementation.base_commit. All edits, builds, tests, staging and commits happen there. Never edit the
+shared checkout.
+
+A. ROOT CAUSE, RESTATED. In your own words, write the failing sequence at base 25e14349f26 with file
+and line for each step (use known_context section 3 as the hypothesis). Name the state that must be
+impossible: no reachable state with overflow_ non-empty, no retry outstanding, and no slot visible to
+the next handler plan. Check at the base whether the handler's plan can reach it (R1 and R4).
+
+B. FIX DESIGN. Start from the smallest rule that the experiment supports:
+  F1: compute the reserve as if no retry were pending (one slot kept free always), and still never
+      insert a second barrier while one is pending. This is the Kres logic in the experiment's
+      a-knobs patch, validated empirically (0/100). Moving it into intercept_queue_logic.h gives a
+      pure, testable function.
+  F2: F1 plus the rule from known_context section 5: insert a barrier only when a spare slot will
+      remain after it lands, or otherwise guarantee a visible free slot at the next handler plan.
+Choose by the model check in step C, not by the experiment alone. Record every rule you reject with
+its counterexample. Keep the change in intercept_queue_logic.h where possible. Do not add
+diagnostic code, knobs, counters, or environment variables to the fix.
+
+C. HOST-SIDE VERIFICATION (no GPU).
+  1. Add regression tests to projects/rocr-runtime/rocrtst/suites/functional/intercept_queue/
+     intercept_queue_logic_test.cc for the R1 and R4 states and for the invariant. They must FAIL at
+     base 25e14349f26 and PASS with the fix. Keep the nine existing tests passing.
+  2. Write an exhaustive state-machine check of the submit and handler sequence (write, read, qsize
+     2..8, pending, overflow_ non-empty, count, marker, and a read index that may lag the barrier's
+     signal by any amount up to the barrier). The property: from every reachable state, a free slot is
+     visible to the next handler plan whenever overflow_ is non-empty and no retry is pending, and
+     overflow_ eventually drains as the ring drains. Run it at base (must produce a counterexample) and
+     with the fix (must produce none). Keep the checker out of the shipped build unless it is also a
+     clean unit test.
+  3. Build and run the tests in the builder container with gtest, and record the exact command and
+     the output. Format any changed Python with ruff (see ~/.claude/rules/python-style.md).
+
+D. BUILD. Build the runtime from the worktree in the builder container, with the recipe the
+experiment used (Release, Ninja, the same CMake flags, no RSPGR or trace defines):
+  SDK_DEV=/usr/local/lib/python3.12/dist-packages/_rocm_sdk_devel
+  SYSDEPS=$SDK_DEV/lib/rocm_sysdeps
+  cd /src/projects/rocr-runtime && cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_PREFIX_PATH="$SDK_DEV;$SYSDEPS" -DCMAKE_INSTALL_PREFIX="$SDK_DEV" \
+    -DLIBELF_INCLUDE_DIRS="$SYSDEPS/include" -DLIBELF_LIBRARIES="$SYSDEPS/lib/libelf.so"
+  cmake --build build --parallel 64 && cmake --install build --prefix <out> --strip
+Only libhsa-runtime64 changes, so stage only that library and keep image A's HIP library. Build the
+control (the faithful rebuild, no patch) with the same recipe and compare its libhsa sha256 with the
+experiment's a-rebuilt record. Derive the images from an empty context holding staging/ and
+unstripped/, using this Dockerfile, tagged `local/{{formula_id}}:a-fix` (the fix) and
+`local/{{formula_id}}:a-base` (the control, if {{control_image}} is not on the node):
+----- BEGIN Dockerfile -----
+{{variant_dockerfile}}
+----- END Dockerfile -----
+Record image
+IDs, sha256 of every replaced library, and the commit SHA. Verify in a container that the loader maps
+the rebuilt library. Check that the rebuilt base library's code matches the experiment's a-rebuilt
+library for the key functions (StoreRelaxed, Submit, HandleRetryDoorbell).
+
+E. GPU VALIDATION ON {{node}} (GPUs 0-3, one 4-GPU set; repro as in the experiment's arms).
+  1. Preflight. The repro's correctness check passes in the fix image and the control image. The
+     expected library is mapped. A clean trial of each arm completes, and the trial timeout is set from it.
+  2. Fidelity and fix, interleaved in blocks with a fixed seed (record it): control {{control_image}}
+     and fix `local/{{formula_id}}:a-fix`, {{trials_per_arm}} trials each. Prediction: the control hangs
+     at about 20 %, the fix 0 %. Stop early and report if the fix hangs in any trial (a fix failure).
+  3. Stress test (optional, but strongly recommended): build the fix with the experiment's
+     forced-window knob (RSPGR_HOLD_US=2000) in a scratch branch that is NEVER committed, and run it
+     {{trials_per_arm}} trials on GPUs 0-3. The fix must still show 0 hangs. This tests the fix against
+     the window the experiment proved is dangerous.
+  4. Performance: at least {{trials_per_arm}} clean trials per arm (fix and control), in the same
+     blocks. Report median wall-clock and per-replay event time, and a Mann-Whitney p.
+  5. Full bench (optional, if budget remains): `vllm bench forward` at TP=8 with the decode64k case,
+     10 runs per arm, to test the fix on the configuration that hung 65/100 on image A. Report it as a
+     separate result. Do not replace the repro result with it.
+  6. Hang capture. Any hang in the fix arm is a failure of the fix: capture the state per gpu_rules
+     step 5, and record retry_outstanding, overflow_ size, the wrapped read and write indices, and
+     which path ran. Then stop.
+  7. Fit the total to {{time_budget_hours}} hours. If the budget runs out, stop after a complete block
+     of arms (so arms stay balanced) and report the counts you have.
+Report every result with its trial count, hang count, Wilson 95 % CI, and Fisher two-sided p.
+
+F. COMMIT. Stage only the files of the fix by explicit path (the header, the optional intercept_queue.cpp
+change, and the test file). Inspect the staged diff. Run `git diff --cached --check`. Follow the rig's
+commit and DCO rules (check its CONTRIBUTING file and hooks). Never bypass a failing hook. Commit on
+`{{formula_id}}/implement/<claimed-bead-id>` with a message that explains why the change is needed.
+End the commit message with this line:
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+Record the full hash as implementation.commit_hash. Do not merge, push, or open a PR.
+
+G. OUTPUTS. Use {{artifact_dir}}/implement/ (create it; do not overwrite earlier files). Write
+{{artifact_dir}}/implement/implementation.md with: producer bead IDs and their report paths; the root
+cause restated with file and line citations at the base; the fix design (F1 or F2, and each rejected
+rule with its counterexample); the model-check and unit-test commands and results; the build recipe
+and every library sha256 and image ID; the validation tables (fidelity, stress, performance, and
+any full-bench run) with trial counts, hangs, Wilson 95 % CI, Fisher p and Mann-Whitney p; every
+hang with its evidence path; failed trials and their causes; what the fix does not cover (image B,
+develop, TP other than 4 unless run); and what remains uncertain. Export
+{{artifact_dir}}/implement/implementation.patch with `git diff --binary {{base_commit}} <fix commit>`.
+Append the summary and absolute paths to this claimed step's notes with
+`gc bd update <claimed-bead-id> --append-notes <text>`. Set implementation.report_path,
+implementation.patch_path, implementation.commit_hash, and gc.outcome=pass, then close only this step.
+Use gc.outcome=pass when the fix is committed and validated. Use pass for a fix that is committed but
+has a documented limit, as long as the limit is stated.
+
+BLOCKED OR FAILED. If the model check finds no rule that passes, if validation shows a hang in the fix
+arm, if the derived image cannot be built or loaded, or if the node is unavailable: write a partial
+report with the blockers and the worktree progress, append the reason to the bead, set gc.outcome=fail
+and gc.failure_reason, and close only this step. Do not fabricate results. Do not close earlier steps
+or the workflow root.
+"""

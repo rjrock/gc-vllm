@@ -1,0 +1,638 @@
+formula = "flint-rocm-decode-kernel-fusion"
+version = 1
+description = """\
+Follow-up to flint-kv-cache-layout-fix (root bead vl-o2jh, fully closed, \
+`gc.outcome=pass`/shipped): that workflow's own investigation redirected away from \
+a suspected KV-cache physical-layout mismatch and instead pinned the real bug to \
+`vllm/models/flint/ops/norm.py`'s `_rsqrt()` Triton helper -- a hardcoded PTX \
+`rsqrt.approx.ftz.f32` inline-asm string that is CUDA-ISA-only and silently compiles \
+to garbage on Triton's AMDGCN (ROCm) backend instead of raising. The shipped fix \
+(commit d37904eddced37fd380c3e4187253a2342a8a1c6, branch \
+flint-kv-cache-layout-fix/implement/vl-5wit, not yet on vllm main) gives `_rsqrt()` a \
+`current_platform.is_cuda()` branch: CUDA keeps the original inline asm \
+character-for-character, ROCm instead calls `tl.math.rsqrt()`. With that fix, Flint \
+now serves real, sane chat completions end-to-end on ROCm/MI300X (gfx942) via vLLM's \
+generic, backend-agnostic layers (`unified_attention_with_output`, stock \
+`FusedMoEFactory`/aiter MoE) -- `_flint_kernels()` (vllm/models/flint/model.py) still \
+unconditionally returns False whenever \
+`not current_platform.is_device_capability_family(100)`, so none of Flint's hand-written \
+fused CuTe-DSL (cutlass/cute/quack) decode kernels under vllm/models/flint/ops/ \
+(`qkv_fused.py`, `decode_attention.py`, `nvfp4_gemv.py`, `linear.py`, `moe*.py`, all \
+SM100/Blackwell-only) ever activate on ROCm.
+
+This workflow's charter is the natural next step once correctness was established: \
+Flint is now correct but slow on ROCm relative to its NVIDIA/SM100 fused-kernel path. \
+A direct trace comparison (this formula's authoring session, profiler output at \
+/home/ryrock/dev/alfred/recipes/nvidia/flint/{profile-shapes-prefill_10000,amd-profile-shapes-prefill_10000}/analysis/top_kernels-c1.yaml, \
+same model, matched decode-heavy shapes) found two concrete, high-value fusion gaps \
+where NVIDIA's decode step runs one fused CuTe-DSL kernel and ROCm instead runs \
+several separate, unfused kernels:
+1. Decode attention: NVIDIA's single fused `FlintDecodeAttention` kernel \
+   (ops/decode_attention.py) is 8.3% of total kernel time in that capture; ROCm's \
+   generic, unfused `kernel_unified_attention_2d`/`_3d` (reached via \
+   `unified_attention_with_output`) together cost 21.0% (18.0% + 3.0%).
+2. Small-M QKV dense projection + per-head norm/RoPE/cache-write: NVIDIA's \
+   `qkv_fused` kernel (ops/qkv_fused.py, its norm sub-kernel and GEMV+RoPE+cache-write \
+   sub-kernel together) is 15.3% (12.4% + 2.9%); ROCm instead runs a separate, unfused \
+   `wvSplitK_hf_sml_<__hip_bfloat16,...>` GEMV plus the ALREADY-FUSED, ALREADY-PORTABLE \
+   `_qk_norm_rope_cache_kernel` (ops/qk_norm_rope.py, plain Triton, confirmed running \
+   correctly on ROCm today), together costing 24.1% (20.2% + 3.9%).
+
+MoE routing was also compared (NVIDIA `_router_kernel` 6.4% vs. ROCm `topkGating` \
+5.8%) and found to be roughly at parity already -- NOT a clear fusion win on the \
+evidence gathered so far, so it is explicitly OUT of scope for this workflow; a future \
+formula can revisit it with fresh evidence rather than this one guessing from a single \
+capture.
+
+CuTe-DSL (cutlass/cute/quack) is NVIDIA/SM100-only and not portable to ROCm as source; \
+this workflow's technology direction is Triton, since it is PROVEN ALREADY WORKING on \
+this exact hardware inside this exact file tree: `ops/qk_norm_rope.py`'s \
+`_qk_norm_rope_cache_kernel` and `ops/norm.py`'s RMSNorm/SiLU kernels are plain Triton \
+(no inline PTX asm, or PTX asm now correctly gated per the flint-kv-cache-layout-fix \
+fix) and are confirmed present and correct in the ROCm profile capture above. New fused \
+kernels for this workflow should follow that same shape: plain `@triton.jit`, backend- \
+neutral or explicitly `current_platform.is_cuda()`-gated where a CUDA-only trick is \
+used, mirroring the `_rsqrt()` precedent exactly rather than re-deriving a different \
+pattern."""
+
+[requires]
+formula_compiler = ">=2.0.0"
+
+[vars.artifact_dir]
+description = "Absolute, shared artifact directory, unique to this workflow run."
+required = true
+pattern = "^/"
+
+[vars.formula_id]
+description = """\
+Run identifier used to label this run's worktree directories and branches \
+(<rig>/{{formula_id}}/<step>/<bead-id>). Defaults to this formula's name."""
+default = "flint-rocm-decode-kernel-fusion"
+pattern = "^[A-Za-z0-9_.-]+$"
+
+[vars.node]
+description = """\
+Node to run repro/validation containers and `vllm serve` commands on, reached via \
+plain `ssh {{node}} ...` (key-based, no interactive auth). Defaults to s79, the same \
+MI300X (gfx942) host the two prior Flint ROCm workflows used, confirmed reachable with \
+8 MI300X GPUs via `ssh s79 rocm-smi --showproductname` at those workflows' authoring \
+time. Re-verify architecture (`ssh {{node}} rocm-smi --showproductname`) and GPU \
+availability (`ssh {{node}} rocm-smi --showuse`) on whichever node is set here before \
+trusting any result from it; do not assume either fact without checking, since node \
+availability and contention change over time. If every GPU on `{{node}}` is busy, \
+record that as a blocker rather than switching nodes without re-confirming architecture \
+and artifact presence on the replacement."""
+default = "s79"
+
+[vars.image]
+description = """\
+Docker image to reproduce and validate in, on `{{node}}`. Verify it is present there \
+with `ssh {{node}} docker image inspect {{image}}` before using it; do not pull. Built \
+from {{base_ref}} (the flint-kv-cache-layout-fix fix), and the same image \
+/home/ryrock/dev/alfred/recipes/nvidia/flint/amd.yaml already uses for profiling -- \
+re-verify it still serves sane (non-garbage) chat completions before doing anything \
+else, since this workflow's entire premise is a PERFORMANCE change on top of that \
+already-correct behavior."""
+default = "rjrock2/vllm:rocm-ci_base-nov02-flint-kv-cache-layout-fix-implement-vl-5wit"
+
+[vars.repo_path]
+description = """\
+Host vllm checkout (registered as the vllm rig). Resolve the authoritative path via \
+`gc rig list --json` rather than trusting this default blindly."""
+default = "/home/ryrock/dev/vllm"
+pattern = "^(/.*)?$"
+
+[vars.model_path]
+description = "Flint model weights path, on `{{node}}`."
+default = "/data/models/flint"
+pattern = "^(/.*)?$"
+
+[vars.base_ref]
+description = """\
+Base ref for this workflow's worktrees. Unlike a typical formula, this is NOT empty/ \
+tip-of-tree by default: vllm main does not yet contain the flint-kv-cache-layout-fix \
+fix (confirmed at formula-authoring time via `git merge-base --is-ancestor \
+d37904eddced37fd380c3e4187253a2342a8a1c6 main` on the vllm rig, which failed), so \
+building on tip-of-tree main would silently lose the correctness fix this workflow \
+depends on. Re-verify this is still true before trusting it -- if the fix has since \
+merged to main, prefer tip-of-tree main instead and say so in your report."""
+default = "flint-kv-cache-layout-fix/implement/vl-5wit"
+
+[vars.question]
+description = "Optional extra focus or hints."
+default = ""
+
+[vars.constraints]
+description = """\
+Scope this workflow to exactly the two fusion targets identified in {{known_context}}: \
+(1) decode attention, (2) the small-M QKV dense projection + per-head norm/RoPE/ \
+cache-write path. Do NOT attempt MoE router/gate fusion in this workflow -- the \
+evidence gathered so far shows it at rough parity (NVIDIA 6.4% vs ROCm 5.8%), not a \
+clear win; a future formula should re-evaluate it with its own fresh evidence rather \
+than this workflow extending scope on a guess. Do not re-litigate or revert the \
+flint-kv-cache-layout-fix fix (the `_rsqrt()` CUDA/ROCm branch in \
+vllm/models/flint/ops/norm.py, or the earlier flint-rocm-attention-fix gating fix in \
+`FlintAttention.__init__`, vllm/models/flint/model.py) -- both are confirmed correct \
+and shipped; build on top of them in the same worktree lineage ({{base_ref}}), do not \
+re-derive them.
+
+Implement new kernels in Triton, following the `ops/qk_norm_rope.py` / `ops/norm.py` \
+precedent exactly: plain `@triton.jit`, no inline PTX asm unless explicitly gated by \
+`current_platform.is_cuda()` with a portable (e.g. `tl.math.*`) fallback for ROCm, \
+mirroring the `_rsqrt()` fix's own shape. Any new fusion must be ADDITIVE: a new, \
+ROCm-specific gating predicate (e.g. `_flint_kernels_rocm()` in \
+vllm/models/flint/model.py, mirroring `_flint_kernels()`'s shape -- \
+`current_platform.is_rocm()`, an appropriate arch-family check for gfx942/gfx950, and \
+the same TP=1/no-EP/no-EPLB constraints `_flint_kernels()` already enforces) that \
+activates the new ROCm kernels, living ALONGSIDE the existing SM100 gate. Do not modify \
+`_flint_kernels()` itself, any CUDA/cutlass/cute/quack file under ops/, or any existing \
+CUDA-path behavior or test (tests/models/flint/test_flint_ops.py, \
+test_decode_attention.py, test_qk_norm_rope.py, test_qkv_fused.py, test_flint_moe.py, \
+test_gguf_nvfp4.py) -- these must remain exactly unchanged for CUDA; they are expected \
+to skip (not fail) on `{{node}}`'s ROCm hardware per their existing \
+`current_platform.is_cuda()` skip guards, same pattern as test_decode_attention.py's \
+own `pytest.skip(..., allow_module_level=True)`. Add new, ROCm-parametrized test \
+file(s) under tests/models/flint/ alongside (not replacing) the existing ones, using an \
+analogous skip-on-non-ROCm guard.
+
+This is a PERFORMANCE workflow, not a correctness workflow -- but correctness is still \
+the primary gate: any new fused kernel must reproduce the exact numerics of what it \
+replaces (RMSNorm/RoPE formulas as documented in ops/qk_norm_rope.py's own docstring; \
+attention sinks/sliding-window semantics as currently implemented by \
+`unified_attention_with_output`), validated with real `vllm serve` + real chat \
+completions, not just a kernel-level unit match. A measurable decode-step speedup \
+(before/after kernel-time share and wall-clock decode latency) is a required SECOND \
+gate, not optional -- reuse /home/ryrock/dev/alfred/recipes/nvidia/flint/ (`amd.yaml`, \
+`amd-profile.sh`, `server.yaml`) as the known-good profiling harness for this, since it \
+already produces exactly the `top_kernels.yaml`/trace artifacts cited in \
+{{known_context}}; do not invent a different profiling method without saying why the \
+existing harness did not work. Do not run `pip install`/`pip uninstall` against vllm \
+inside any container in this workflow, for any reason -- see {{editable_mode_notes}}."""
+
+[vars.known_context]
+description = """\
+What is already established from the two prior, fully-closed Flint ROCm workflows -- \
+evidence to build on, not a conclusion to copy blindly. Re-verify anything load-bearing \
+before relying on it."""
+default = '''1. CONFIRMED, CLOSED WORKFLOW #1: flint-rocm-attention-fix (root vl-apjh)
+fixed Flint's construction-time crash on ROCm/gfx942 by gating the unconditional
+FlashInfer import/assert in `FlintAttention.__init__` (vllm/models/flint/model.py),
+falling back to vLLM's generic `unified_attention_with_output()` path when no
+FlashInfer impl is in use. Fully closed; do not re-test or revert this.
+
+2. CONFIRMED, CLOSED WORKFLOW #2: flint-kv-cache-layout-fix (root vl-o2jh, reports
+at {{prior_investigation_report}}, {{prior_experiment_report}},
+{{prior_implementation_report}}) investigated the resulting degenerate-chat-completion
+symptom, redirected (via direct instrumentation, not assumption) from a suspected
+KV-cache physical-layout mismatch to the real cause: `_rsqrt()` in
+vllm/models/flint/ops/norm.py hardcoded CUDA-only PTX inline asm
+(`rsqrt.approx.ftz.f32`), which Triton's ROCm/AMDGCN backend does not reject but
+silently miscompiles. Shipped fix (commit
+d37904eddced37fd380c3e4187253a2342a8a1c6, branch
+flint-kv-cache-layout-fix/implement/vl-5wit): `_rsqrt()` branches on
+`current_platform.is_cuda()`, keeping the exact original inline asm for CUDA and
+calling `tl.math.rsqrt()` for everything else. Validated end-to-end on MI300X/gfx942
+via real `vllm serve` + real chat-completion HTTP requests (image
+rjrock2/vllm-ci-ext:oct28 at validation time; this workflow's {{image}} default is the
+subsequently-built image from this exact fix commit).
+
+3. CONFIRMED BY REAL TRACE EVIDENCE (this formula's own authoring session, NOT part
+of either prior workflow): with the above fix applied, Flint serves correct output on
+ROCm but with a slower decode step than its NVIDIA/SM100 fused-kernel path. Matched
+decode-heavy profiling captures (same model, same shapes, profiler output at
+/home/ryrock/dev/alfred/recipes/nvidia/flint/profile-shapes-prefill_10000/analysis/top_kernels-c1.yaml
+for NVIDIA and
+/home/ryrock/dev/alfred/recipes/nvidia/flint/amd-profile-shapes-prefill_10000/analysis/top_kernels-c1.yaml
+for ROCm) show:
+   - Decode attention: NVIDIA's fused `FlintDecodeAttention` kernel
+     (vllm/models/flint/ops/decode_attention.py) is 8.3% of total kernel time; ROCm's
+     unfused `kernel_unified_attention_2d` + `kernel_unified_attention_3d` (reached via
+     `unified_attention_with_output`, vllm/model_executor/layers/attention/attention.py)
+     together cost 21.0% (18.0% + 3.0%).
+   - Small-M QKV dense projection + per-head norm/RoPE/cache-write: NVIDIA's
+     `qkv_fused` kernel and its norm sub-kernel (vllm/models/flint/ops/qkv_fused.py)
+     together are 15.3% (12.4% + 2.9%); ROCm instead runs a separate, unfused
+     `wvSplitK_hf_sml_<__hip_bfloat16,...>` GEMV (the generic dense-linear path) plus
+     the ALREADY-FUSED, ALREADY-PORTABLE `_qk_norm_rope_cache_kernel`
+     (vllm/models/flint/ops/qk_norm_rope.py, plain Triton -- confirmed running
+     correctly on ROCm today), together costing 24.1% (20.2% + 3.9%).
+   - MoE routing is roughly at parity (NVIDIA `_router_kernel` 6.4% vs ROCm
+     `topkGating` 5.8%) -- NOT a confirmed fusion win; explicitly out of scope per
+     {{constraints}}.
+These percentages are single-capture estimates from one profiling run each, not a
+statistically robust benchmark -- re-measure fresh with the same harness
+(/home/ryrock/dev/alfred/recipes/nvidia/flint/amd-profile.sh) before and after any
+candidate fix, rather than trusting these specific numbers as ground truth.
+
+4. THE FUSION-TECHNOLOGY CONSTRAINT: NVIDIA's fused kernels
+(ops/qkv_fused.py, ops/decode_attention.py, ops/nvfp4_gemv.py, ops/linear.py,
+ops/moe*.py) are all written in CuTe-DSL (`import cutlass`, `cutlass.cute`,
+`quack.compile_utils`), gated behind `_flint_kernels()`'s
+`current_platform.is_device_capability_family(100)` check -- genuinely SM100/
+Blackwell-only, not portable to ROCm as source, and NOT this workflow's starting
+point for implementation (do not attempt to compile or adapt CuTe-DSL for ROCm).
+The viable technology, PROVEN ALREADY WORKING on this exact hardware in this exact
+file tree, is Triton: ops/qk_norm_rope.py's `_qk_norm_rope_cache_kernel` (fused
+per-head q/k RMSNorm + NeoX RoPE + paged KV-cache write) and ops/norm.py's RMSNorm/
+SiLU kernels are plain `@triton.jit` functions, confirmed present and correct in the
+ROCm profile capture in point 3 above. Use `qk_norm_rope_cache()`'s own docstring
+(numerics: "RMSNorm computes bf16(x * rsqrt(mean(x^2) + eps) * w) in fp32, RoPE
+computes x * cos - y * sin in fp32 from the fp32 cos/sin cache ... and rounds to
+bf16") as the authoritative reference for what any new fused kernel must numerically
+reproduce.
+
+5. NOT YET CHECKED by either prior workflow or this formula's authoring session:
+the precise Triton kernel-fusion boundary for ROCm decode attention (e.g. whether a
+single fused kernel analogous to FlintDecodeAttention's split-KV paged-attention
+shape is feasible in Triton on CDNA3/gfx942, or whether a narrower fusion -- e.g.
+folding the sliding-window/sink logic into fewer kernel launches without a full
+from-scratch attention kernel -- is more tractable); the exact small-M threshold
+and dispatch shape for a Triton QKV GEMV fast path analogous to ops/linear.py's
+`_use_gemv()` dispatch; whether aiter (the AMD kernel library already used elsewhere
+in this vllm fork for MoE) exposes any usable building block for either target
+instead of a from-scratch Triton kernel. All of this is the investigation step's job
+to pin down, not an assumption for implementation to start from.'''
+
+[vars.prior_investigation_report]
+description = """\
+Absolute path to flint-kv-cache-layout-fix's investigation report (the direct \
+instrumentation that redirected root cause to `_rsqrt()`). Read this in full before \
+doing anything else."""
+default = "/home/ryrock/dev/cities/runs/flint-kv-cache-layout-fix/run.UTvgWQ/investigate/investigation.md"
+pattern = "^(/.*)?$"
+
+[vars.prior_experiment_report]
+description = """\
+Absolute path to flint-kv-cache-layout-fix's experiment report (validated the \
+`_rsqrt()` fix fresh, end-to-end, via real `vllm serve` + chat completions). Read this \
+in full before doing anything else."""
+default = "/home/ryrock/dev/cities/runs/flint-kv-cache-layout-fix/run.UTvgWQ/experiment/experiments.md"
+pattern = "^(/.*)?$"
+
+[vars.prior_implementation_report]
+description = """\
+Absolute path to flint-kv-cache-layout-fix's implementation report: the exact commit \
+(d37904eddced37fd380c3e4187253a2342a8a1c6), worktree/branch lineage \
+({{base_ref}}), and validation this workflow's {{base_ref}} already carries. Read this \
+in full before doing anything else -- it is this workflow's starting point, not \
+something to re-derive."""
+default = "/home/ryrock/dev/cities/runs/flint-kv-cache-layout-fix/run.UTvgWQ/implement/implementation.md"
+pattern = "^(/.*)?$"
+
+[vars.gpu_rules]
+description = """\
+Rules for using {{node}}'s GPUs safely. No fallback host template -- confirm whichever \
+node you use."""
+default = '''GPU RULES (resolve <NODE> and <IMAGE> below to the concrete NODE/IMAGE
+values stated directly above where this block is included -- do not treat these
+angle-bracket names as literal hostnames/images. <NODE> is expected to have 8 MI300X
+(gfx942) GPUs, shared with other users -- re-verify this count/architecture on <NODE>
+itself rather than assuming it).
+1. Confirm `<NODE>` is reachable (`ssh <NODE> true`) and is gfx942 (MI300X)
+   (`ssh <NODE> rocm-smi --showproductname`) before using it. s79 is confirmed
+   gfx942/MI300X at formula-authoring time; re-verify whichever you use, since this is
+   not guaranteed to stay true. Use ONE GPU per container for investigate/experiment
+   iteration (TP=1 is this model's only required configuration here). Before every
+   launch run `ssh <NODE> rocm-smi --showuse` and `ssh <NODE> rocm-smi --showmeminfo
+   vram`; pick a GPU with 0% use and ~no VRAM held. Never use a busy GPU. Record the
+   index (and node) in your report. If every GPU on `<NODE>` is busy, record that as a
+   blocker rather than switching nodes without re-confirming architecture and artifact
+   presence on the replacement.
+2. Run containers (via `ssh <NODE> docker ...`) with `--device=/dev/kfd
+   --device=/dev/dri --group-add video --security-opt seccomp=unconfined --ipc=host
+   --shm-size=16g` and `-e HIP_VISIBLE_DEVICES=<idx>`, name them with your claimed bead
+   ID, use `--entrypoint bash` for interactive/debug containers (the image entrypoint is
+   not a shell) or `--entrypoint vllm` for a direct serve launch, and `docker rm -f`
+   them when done, on every error path (including via `ssh <NODE> docker rm -f ...`).
+3. The final, downstream-facing validation should use `uv run al launch` (the alfred
+   recipe harness at /home/ryrock/dev/alfred/recipes/nvidia/flint/, `amd.yaml` +
+   `server.yaml` + `profile.yaml` via `amd-profile.sh`) from `<NODE>` (via
+   `ssh <NODE> ...`) rather than a raw `docker run`, for any step that is actually
+   standing up a server to serve real traffic end-to-end or collecting before/after
+   performance evidence (as opposed to a quick interactive debug container used while
+   iterating on a candidate kernel itself, which may use docker directly).
+4. Flint's checkpoint at {{model_path}} is ~75GB (bf16); a single MI300X has ample
+   VRAM headroom for TP=1, but confirm actual usage with `ssh <NODE> rocm-smi
+   --showmeminfo vram` rather than assuming.
+5. Do not modify the image. Do not run `docker commit` over `<IMAGE>`. Bind-mount your
+   vllm worktree's sources (synced to `<NODE>`, e.g. via `rsync -a --delete`)
+   READ-WRITE over /root/dev/vllm at container-run time; the underlying image is never
+   altered.
+6. Disk: check `df -h` on `<NODE>` before large builds; layout/capacity may differ from
+   any other host.'''
+
+[vars.editable_mode_notes]
+description = "Editable-mode verification notes, same pattern as the prior workflow."
+default = '''`{{image}}` already has vllm `pip install -e`'d against /root/dev/vllm at
+commit d37904eddced37fd380c3e4187253a2342a8a1c6 (this workflow's {{base_ref}}). The
+overwrite this task requires is: sync your vllm rig worktree's sources to `{{node}}`
+(e.g. via `rsync -a --delete`), then bind-mount them, READ-WRITE, over /root/dev/vllm
+inside the container. New Triton kernels are pure-Python (no C++/CUDA/HIP rebuild
+required for Triton itself -- Triton JIT-compiles at call time); if your candidate
+genuinely needs a non-Python rebuild step, say so explicitly and justify why. Verify
+genuine editable mode against YOUR synced sources by: (a) `python3 -c "import vllm;
+print(vllm.__file__)"` resolving inside the mounted worktree, not a stale
+dist-packages copy; (b) the git HEAD at that path (`git -C <mounted-path> rev-parse
+HEAD`) matching your worktree's actual commit, not d37904eddced37fd380c3e4187253a2342a8a1c6
+(the image's baked-in commit) once you have made and committed your change. Do NOT
+run `pip install`, `pip uninstall`, `pip install -e .`, or any other pip
+install/uninstall command against vllm inside the container, for any reason. Do NOT
+bind-mount or modify any aiter checkout in this workflow unless investigation
+specifically identifies a usable aiter building block to call into (not to modify).'''
+
+[[steps]]
+id = "body"
+title = "Investigate, experiment, and implement ROCm-native Triton fusions for Flint's decode step"
+needs = ["implement"]
+metadata = { "gc.kind" = "scope", "gc.scope_name" = "flint-rocm-decode-kernel-fusion", "gc.scope_role" = "body" }
+
+[[steps]]
+id = "investigate"
+title = "Pin the exact ROCm decode-attention and QKV-fusion kernel boundaries and a Triton implementation plan"
+needs = []
+metadata = { "gc.run_target" = "vllm/investigation.investigator", "gc.scope_ref" = "body", "gc.scope_role" = "member", "gc.on_fail" = "abort_scope" }
+description = """
+Read `{{prior_investigation_report}}`, `{{prior_experiment_report}}`, and
+`{{prior_implementation_report}}` in full before doing anything else. All three are
+from a prior, now fully-closed workflow (root bead vl-o2jh) on this exact model
+(gfx942/MI300X) -- do not re-derive what they already established (the `_rsqrt()`
+fix is confirmed correct and shipped at commit
+d37904eddced37fd380c3e4187253a2342a8a1c6; do not re-test or revert it), and do not
+duplicate their repro-building work; reuse their worktree lineage and fix commit
+({{base_ref}}) as your starting point.
+
+{{known_context}}
+
+Environment: use docker image `{{image}}` on `{{node}}` (verify presence with `ssh
+{{node}} docker image inspect {{image}}`). Resolve the vllm rig's source repository
+using `gc rig list --json` (registered path hint: {{repo_path}}); confirm
+`{{base_ref}}` still does NOT exist on the rig's default branch
+(`git merge-base --is-ancestor d37904eddced37fd380c3e4187253a2342a8a1c6 main`) before
+assuming you need it as a separate base, since this could have changed since
+authoring time.
+
+NODE={{node}} IMAGE={{image}} -- resolve every `<NODE>`/`<IMAGE>` placeholder in the
+rules below to these values.
+
+{{gpu_rules}}
+
+Additional focus or hints: {{question}}
+
+Diagnose and design only; do not implement a fix in this step. Concretely:
+
+- Re-verify the kernel-time comparison in {{known_context}} point 3 is still
+  representative: re-run (or confirm fresh results from) the alfred profiling
+  harness (/home/ryrock/dev/alfred/recipes/nvidia/flint/amd-profile.sh) against
+  `{{image}}` on `{{node}}`, and compare against the cited NVIDIA capture. Do not
+  assume last session's single-capture percentages hold; if they diverge
+  meaningfully, say so and use your fresh numbers.
+- For decode attention: read `vllm/models/flint/ops/decode_attention.py`
+  (`FlintDecodeAttention` / `flint_decode_attention`) as the STRUCTURAL reference
+  for what gets fused and its exact numerics (split-KV paged decode attention, GQA,
+  bf16 KV, HND page layout, attention sinks via
+  `exp2(sink*log2e - m*c)` added to the denominator, sliding-window support) -- NOT
+  as portable code (it is CuTe-DSL/SM100-only). Read
+  `vllm/model_executor/layers/attention/attention.py`'s
+  `unified_attention_with_output()` and whichever ROCm attention kernel(s) it
+  currently dispatches to for this config (confirm which one -- there are multiple
+  ROCm attention backend files under vllm/v1/attention/backends/). Determine
+  whether a Triton-based fused decode-attention kernel (single-kernel split-KV
+  paged attention matching FlintDecodeAttention's numerics) is tractable on
+  gfx942/CDNA3, or whether aiter already exposes a comparable fused building block
+  that could be called instead of writing one from scratch -- check for this before
+  assuming a from-scratch kernel is required.
+- For the QKV fast path: read `vllm/models/flint/ops/qkv_fused.py`
+  (`flint_qkv_fused`) as the STRUCTURAL reference (residual-add RMSNorm fused with
+  QKV GEMV + per-head q/k RMSNorm + RoPE + paged KV-cache write, for decode batches
+  `M <= MAX_M`), and `vllm/models/flint/ops/qk_norm_rope.py`
+  (`qk_norm_rope_cache`/`_qk_norm_rope_cache_kernel`) and `vllm/models/flint/ops/
+  norm.py` as the TECHNOLOGY reference (plain Triton, already correct on ROCm).
+  Determine the exact additional fusion boundary needed (folding the dense QKV GEMV
+  itself into the existing Triton `_qk_norm_rope_cache_kernel`, or a new preceding
+  Triton GEMV kernel feeding it) and the small-M dispatch threshold analogous to
+  `ops/linear.py`'s `_use_gemv()`/`pick_nt()` dispatch tables, tuned for CDNA3's
+  own GEMV characteristics (do not assume NVIDIA's MAX_M=8 or tuned-table shapes
+  transfer directly).
+- Specify the exact new ROCm gating predicate shape (e.g. `_flint_kernels_rocm()`
+  in vllm/models/flint/model.py, mirroring `_flint_kernels()`'s
+  `current_platform.is_device_capability_family(100)` check with an analogous
+  `current_platform.is_rocm()` + gfx942/gfx950 arch check, and the same TP=1/
+  no-EP/no-EPLB constraints) and exactly where in `FlintAttention`/`FlintModel`'s
+  forward path the new kernels would be dispatched from, additively, without
+  touching the existing SM100 branch.
+- Identify what precise test coverage (tests/models/flint/) the implement step
+  should add: new ROCm-parametrized test file(s) analogous to
+  test_decode_attention.py/test_qkv_fused.py, using a `current_platform.is_rocm()`
+  (or equivalent) skip guard mirroring their existing `is_cuda()`-gated
+  `pytest.skip(..., allow_module_level=True)` pattern.
+
+Use `{{artifact_dir}}` as the shared directory for this run. Write your artifacts
+under `{{artifact_dir}}/investigate/`, creating that subdirectory if needed; it must
+not contain an earlier run's reports. Do not overwrite existing files.
+
+Before closing this step, write `{{artifact_dir}}/investigate/investigation.md`
+with:
+- Your claimed bead ID, the vllm commit used, image used, host/GPU used, and date.
+- Your fresh (or confirmed) kernel-time comparison, with file:line citations for
+  every kernel/dispatch path named.
+- For each of the two in-scope fusion targets: the precise kernel-fusion boundary,
+  the Triton implementation approach (or aiter building block, if found), and
+  reasoning for why it is expected to reduce kernel-launch/dispatch overhead
+  relative to the current unfused path.
+- The exact new gating predicate and dispatch wiring shape.
+- The new test coverage plan.
+- A minimal experiment plan for the experimenter: hypothesis, prediction, exact
+  commands (including the alfred profiling harness invocation for before/after
+  comparison), distinguishing result (both correctness AND measured speedup).
+
+Append the handoff summary and absolute report path to this claimed step's notes
+with `gc bd update <claimed-bead-id> --append-notes <text>` and record
+`--set-metadata investigation.report_path=<path>`. Verify the report is readable,
+then set `gc.outcome=pass` on this claimed step and close only it.
+
+If blocked (image missing, no idle GPU reachable, cannot produce a usable handoff),
+append the reason, set `gc.outcome=fail` and `gc.failure_reason=<reason>`, and close
+only this step. Do not close the workflow root.
+"""
+
+[[steps]]
+id = "experiment"
+title = "Validate a candidate Triton-fused decode-attention and QKV kernel, confirming correctness and measured speedup"
+needs = ["investigate"]
+metadata = { "gc.run_target" = "vllm/experimentation.experimenter", "gc.scope_ref" = "body", "gc.scope_role" = "member", "gc.on_fail" = "abort_scope" }
+description = """
+Read `{{artifact_dir}}/investigate/investigation.md` before running anything. Read
+the producer bead ID recorded in it, and verify it belongs to the same
+`gc.root_bead_id` as your claimed step and has `gc.outcome=pass`. Test environment:
+docker image `{{image}}` on `{{node}}`.
+
+NODE={{node}} IMAGE={{image}} -- resolve every `<NODE>`/`<IMAGE>` placeholder in the
+rules below to these values.
+
+{{gpu_rules}}
+
+Additional focus or hints: {{question}}
+
+Use a worktree at
+`~/dev/cities/gc-worktrees/vllm/{{formula_id}}/experiment/<claimed-bead-id>` on
+branch `{{formula_id}}/experiment/<claimed-bead-id>`, per your pack's worktree
+protocol, based on `{{base_ref}}` (confirm fresh whether tip-of-tree main has since
+absorbed that commit; if so, prefer main and say so). Sync this worktree's sources
+to `{{node}}` (e.g. via `rsync -a --delete`) before bind-mounting them into any
+container there.
+
+Test the investigation's hypothesis and candidate fusion designs; do not assume its
+conclusions are correct, including whether a from-scratch Triton kernel or an aiter
+building block is actually the better path for decode attention. Follow your
+six-step protocol for every experiment: hypothesis, prediction (recorded before
+running), exact command/environment, run, actual result, verdict (supports /
+contradicts / inconclusive).
+
+- Reproduce a fresh baseline in your own environment: launch `vllm serve
+  {{model_path}} --tensor-parallel-size=1` on the unmodified {{base_ref}} commit,
+  confirm sane chat completions (per the prior workflow's validated behavior), and
+  capture a baseline profile via the alfred harness
+  (/home/ryrock/dev/alfred/recipes/nvidia/flint/amd-profile.sh, pointed at
+  `{{image}}`/`{{node}}`) to get your own fresh `top_kernels.yaml`/trace evidence
+  rather than reusing the cited session's numbers as your own.
+- Implement the investigation's candidate Triton fusion(s) (decode attention, QKV
+  fast path, or both -- whichever the investigation recommends starting with) in
+  your experiment worktree, bind-mounted read-write over /root/dev/vllm, gated
+  behind the investigation's proposed ROCm predicate. Confirm genuine editable mode
+  per {{editable_mode_notes}} before trusting any result.
+- Re-launch the same `vllm serve` command with the candidate fusion(s) applied and
+  confirm the engine still starts, reaches HTTP-ready, and the new code path is
+  actually reached (log or assert that the new gating predicate is True for this
+  config, rather than assuming).
+- Send real deterministic chat-completion requests and confirm output remains sane
+  (coherent, non-repeating, correct `finish_reason`) and, where feasible, closely
+  matches reference logits/text from the unfused path on the same prompt/seed (a
+  numerical correctness check, not just "looks plausible").
+- Re-run the alfred profiling harness with the candidate fusion(s) applied and
+  compare against your fresh baseline: report the decode-step kernel-time share
+  shift and, if obtainable from the harness's bench output, wall-clock decode
+  latency / throughput change. A fusion that regresses either without a clearly
+  offsetting win elsewhere should be reported as such, not glossed over.
+- Confirm no regression to Flint's CUDA/FlashInfer-reachable code path: `{{node}}`
+  cannot build the cutlass/cute/quack kernels, so a full CUDA-path functional test
+  is not possible there -- statically confirm (via a careful read) that
+  `_flint_kernels()`'s existing SM100 branch and dispatch are untouched by your
+  changes; report this as a static, not dynamic, check.
+- If a candidate does not hold up (no measurable speedup, or correctness fails),
+  test the investigation's next-best alternative (e.g. aiter building block instead
+  of from-scratch Triton, or a narrower fusion boundary) and report clearly which
+  was actually confirmed, if any.
+
+Save experiment records and raw output under `{{artifact_dir}}/experiment/`
+(creating it if needed) and write `{{artifact_dir}}/experiment/experiments.md` with
+the producer bead ID, every experiment's six steps, evidence paths (including
+before/after `top_kernels.yaml`/trace files), verdicts, uncertainties, and a
+recommended fix direction naming the exact vllm source file(s)/function(s), the
+change, and the tested revision -- or, if no viable fusion was found, a clear
+statement of why and what would be needed instead. Do not implement the production
+fix in the shared vllm checkout; candidate edits belong only in your own experiment
+worktree.
+
+Append the summary and absolute artifact paths to this claimed step's notes with
+`gc bd update <claimed-bead-id> --append-notes <text>`, set
+`experiment.report_path=<path>` and `gc.outcome=pass`, and close only this step.
+`pass` means the experiments were completed, even if the hypothesis is contradicted
+or inconclusive.
+
+If the handoff is missing, stale, or unusable, or runtime resources prevent
+execution, record the blocker, set `gc.outcome=fail` and
+`gc.failure_reason=<reason>`, and close only this step. Do not fabricate results or
+close earlier steps or the workflow root.
+"""
+
+[[steps]]
+id = "implement"
+title = "Implement, validate, and commit ROCm-native Triton decode-step fusions for Flint"
+needs = ["experiment"]
+metadata = { "gc.run_target" = "vllm/implementation.implementer", "gc.scope_ref" = "body", "gc.scope_role" = "member", "gc.on_fail" = "abort_scope" }
+description = """
+Read `{{artifact_dir}}/experiment/experiments.md`, the producer experiment bead, and
+the investigation artifacts it cites. Verify the investigation and experiment step
+beads belong to your `gc.root_bead_id`, completed with `gc.outcome=pass`, and
+recorded the report paths you are reading; record their IDs and paths on your
+claimed step.
+
+If the experiments concluded no viable fusion was found for either target (e.g.
+neither decode attention nor the QKV fast path produced a measurable, correctness-
+preserving speedup), write the report documenting that conclusion and the evidence
+for it, set `gc.outcome=pass`, and close only your step -- do not proceed with the
+remaining implementation instructions below unless the experiments recommend at
+least one specific fusion to land.
+
+If the experiments did validate at least one fusion, additional scope and resource
+constraints: {{constraints}}
+
+NODE={{node}} IMAGE={{image}} -- resolve every `<NODE>`/`<IMAGE>` placeholder in the
+rules below to these values.
+
+{{gpu_rules}}
+
+Choose the smallest coherent change supported by the experiments' winning
+candidate(s), in the vllm rig (path hint {{repo_path}}) -- resolve the authoritative
+path via `gc rig list --json`. If the experiments validated only one of the two
+targets, land only that one; do not speculatively implement the other without its
+own validated experiment. Explain why the change preserves existing behavior for
+the CUDA/SM100 path exactly (additive: a new ROCm gating predicate and dispatch
+branch, not a modification of `_flint_kernels()` or any existing CUDA/cutlass/
+cute/quack file). Base ref: {{base_ref}} (re-confirm fresh whether tip-of-tree main
+has since absorbed it; if so, rebase onto main and say so).
+
+Follow your worktree protocol. Record the shared checkout's dirty state,
+branch/HEAD, and protected main/default-branch refs. Create/recover the linked
+worktree `~/dev/cities/gc-worktrees/vllm/{{formula_id}}/implement/<claimed-bead-id>`
+on branch `{{formula_id}}/implement/<claimed-bead-id>`, verifying repository, path,
+ownership, and branch before any edit. Save its absolute path as `work_dir` and
+`implementation.worktree_path`, and record `implementation.branch` and
+`implementation.base_commit`. All edits, builds, tests, staging, and commits happen
+there. Never modify the shared checkout, never advance main, never edit the docker
+image.
+
+Implement the fusion(s) with focused regression coverage (new ROCm-parametrized
+test file(s) under tests/models/flint/, per {{constraints}}). Validate on `{{node}}`
+inside `{{image}}` (sync your vllm worktree's sources to `{{node}}`, e.g. via `rsync
+-a --delete`, per {{gpu_rules}}), confirming genuine editable mode per
+{{editable_mode_notes}} before trusting any result:
+1. The real chat-completion repro the experiment step used to validate its winning
+   candidate(s), re-run against your committed change, confirming sane (non-garbage,
+   numerically-consistent) output, repeated enough times / across enough prompts to
+   be confident it is not a once-lucky result.
+2. A static confirmation that `_flint_kernels()`'s existing SM100 gate, dispatch,
+   and every CUDA/cutlass/cute/quack file are byte-for-byte unchanged.
+3. The full relevant Flint CUDA test suite (tests/models/flint/*), stating plainly
+   that it cannot run on `{{node}}`'s ROCm hardware (expected to skip via its
+   existing `is_cuda()` guards) and that your new ROCm tests actually execute (not
+   silently skip) there.
+4. A real before/after performance comparison via the alfred profiling harness
+   (/home/ryrock/dev/alfred/recipes/nvidia/flint/amd-profile.sh against `{{image}}`
+   rebuilt/bind-mounted with your fix, vs. the unfused baseline), reporting the
+   decode-step kernel-time share shift and wall-clock decode latency change -- this
+   is the primary success evidence for a performance-focused workflow; do not skip
+   it even if correctness alone looks good.
+5. The repository's required lint/pre-commit hooks on changed files.
+Report which results are proxy-only and what remains untested.
+
+After validation passes, recheck the worktree and branch, stage only intended files
+by explicit path, inspect the staged diff, run `git diff --cached --check`, and
+commit on `{{formula_id}}/implement/<claimed-bead-id>` following the repo's
+commit/DCO/hook rules. Never bypass failing hooks. Record the full hash as
+`implementation.commit_hash`. Do not merge, push, or open a PR.
+
+Use `{{artifact_dir}}/implement/` for this run's artifacts (creating it if needed).
+Write `{{artifact_dir}}/implement/implementation.md` (source/producer IDs, fusion(s)
+landed and rationale, worktree/branch/base/fix commits, validation commands and
+results including the before/after performance comparison, limitations, artifact
+paths) and export `{{artifact_dir}}/implement/implementation.patch` with `git diff
+--binary <base-commit> <fix-commit>`. Append the summary and paths to your claimed
+bead, set `implementation.report_path`, `implementation.patch_path`,
+`implementation.commit_hash`, and `gc.outcome=pass`, then close only your step.
+
+If no justified fusion exists, required validation is unavailable, or committing
+fails, write a partial report with blockers, preserve worktree progress, set
+`gc.outcome=fail` and `gc.failure_reason`, and close only your step. Do not close
+earlier steps or the workflow root.
+"""

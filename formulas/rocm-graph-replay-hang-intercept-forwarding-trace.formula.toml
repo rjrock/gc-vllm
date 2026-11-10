@@ -1,0 +1,854 @@
+formula = "rocm-graph-replay-hang-intercept-forwarding-trace"
+version = 1
+description = """\
+Investigate -> experiment on the rocm-systems rig: find out why the read index of the ring that \
+the stuck host polls in the vLLM ROCm CUDA-graph-replay hang stops advancing. Rebuilds the \
+original image's ROCr / HIP / rocprofiler-sdk from their exact revisions, checks the rebuilt \
+runtime still hangs like the shipped one, adds a low-overhead in-memory event trace to the \
+queue-interception forwarding, retry and wake-up path and to HIP's queue-slot wait, captures \
+traces from hung and clean processes, and tests the identified mechanism causally. Diagnostic \
+builds only; nothing is proposed upstream."""
+
+[requires]
+formula_compiler = ">=2.0.0"
+
+[vars.formula_id]
+description = "Run identifier used to label this run's worktree directories and branches."
+default = "rocm-graph-replay-hang-intercept-forwarding-trace"
+pattern = "^[A-Za-z0-9_.-]+$"
+
+[vars.hangs_to_trace]
+description = "Number of hung processes whose traces the experiment captures and analyses."
+default = "3"
+
+[vars.repro_trials_per_arm]
+description = "Standalone-repro trials per arm in the experiment's fidelity and causal comparisons."
+default = "100"
+
+[vars.time_budget_hours]
+description = "Upper bound on node time for the experiment step, in hours. Plan the trial counts to fit it."
+default = "48"
+
+[vars.artifact_dir]
+description = "Absolute, shared artifact directory, unique to this workflow run."
+required = true
+pattern = "^/"
+
+[vars.node]
+description = "GPU node to run on: 8x AMD Instinct MI300X (gfx942, 192 GiB each). Empty = the local host."
+default = ""
+
+[vars.node_notes]
+description = "Extra node-specific rules or facts (scheduled jobs, Slurm partition and GPU gres name, NUMA layout, where models live). Empty = discover them."
+default = ""
+
+[vars.original_image]
+description = "Image A, the original vLLM ROCm nightly with the custom from-source ROCr/HIP runtime. Pull it by digest if absent."
+default = "vllm/vllm-openai-rocm@sha256:2358d61b70974b700b74635953a9ab4646efa39d569ecc5c1eb1d5ab760c3466"
+
+[vars.stock_image_tag]
+description = "Local tag for image B: image A with TheRock's stock rocm-sdk 10.0.0 swapped in by the overlay Dockerfile. Built locally, never pushed."
+default = "local/vllm-rocm-stock-runtime:graph-replay-hang"
+
+[vars.overlay_dockerfile]
+description = "Dockerfile that turns image A into image B. Build with --build-arg BASE_IMAGE=<image A>."
+default = '''# Stock-runtime overlay: replaces the base image's from-source ROCr/HIP runtime with
+# TheRock's stock rocm-sdk 10.0.0 libamdhip64 / libhsa-runtime64 so the base image becomes an
+# exact single-variable control. Experimental; not for upstream.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+ARG SITE_PACKAGES=/usr/local/lib/python3.12/dist-packages
+ARG ROCM_RELEASE_WHEELS_MULTIARCH_URL="https://stable.repo.amd.com/rocm/whl-next/"
+ARG ROCM_SDK_VERSION=10.0.0
+ENV ROCM_PATH=${SITE_PACKAGES}/_rocm_sdk_devel
+
+# Reinstall rocm-sdk-core/-devel from TheRock's stock release wheels. This overwrites the
+# stock file names (libamdhip64.so.7, libhsa-runtime64.so.1, ...) that the base image's
+# hard-link block pointed at the custom build, then drops the custom build's own filename,
+# which the reinstall does not clean up because no wheel ships it.
+RUN uv pip install --system --reinstall --no-deps --no-cache \
+        --index-url ${ROCM_RELEASE_WHEELS_MULTIARCH_URL} \
+        "rocm-sdk-core==${ROCM_SDK_VERSION}" "rocm-sdk-devel==${ROCM_SDK_VERSION}" \
+    && rocm-sdk init \
+    && rm -f "${SITE_PACKAGES}/_rocm_sdk_devel/lib/libamdhip64.so.7.16.26361-25e14349f2"
+
+# Reapply the SDK fixups the reinstall wiped (rocm_smi symlink, rocm-pip.conf, hip-lib
+# dedup symlinks onto the device wheels, rocprofiler-sdk symlink consolidation).
+RUN if [ -f "${SITE_PACKAGES}/rocm_sdk/__init__.py" ]; then \
+        sed -i 's/rtld_global: bool = True/rtld_global: bool = False/g' "${SITE_PACKAGES}/rocm_sdk/__init__.py"; \
+    fi \
+    && if [ -f "${SITE_PACKAGES}/_rocm_sdk_core/lib/librocm_smi64.so.1" ] \
+       && [ ! -e "${ROCM_PATH}/lib/librocm_smi64.so.7" ]; then \
+        ln -sfn "${SITE_PACKAGES}/_rocm_sdk_core/lib/librocm_smi64.so.1" "${ROCM_PATH}/lib/librocm_smi64.so.7"; \
+    fi \
+    && printf '%s\n%s\n' "${ROCM_PATH}/lib" "${SITE_PACKAGES}/_rocm_sdk_core/lib" > /etc/ld.so.conf.d/rocm-pip.conf \
+    && for f in ${SITE_PACKAGES}/_rocm_sdk_core/lib/libamdhip64.so*; do \
+        bn=$(basename "$f"); \
+        if [ -f "${ROCM_PATH}/lib/${bn}" ] && [ -f "$f" ] && [ ! -L "$f" ]; then \
+            rm -f "$f"; \
+            ln -sfn "${ROCM_PATH}/lib/${bn}" "$f"; \
+        fi; \
+    done \
+    && for f in librocprofiler-sdk.so.1 librocprofiler-register.so.0 \
+              librocprofiler-sdk-roctx.so.1; do \
+        if [ -e "${SITE_PACKAGES}/_rocm_sdk_core/lib/${f}" ] \
+           && [ -e "${SITE_PACKAGES}/_rocm_sdk_devel/lib/${f}" ]; then \
+            rm -f "${SITE_PACKAGES}/_rocm_sdk_core/lib/${f}"; \
+            ln -sfn "${SITE_PACKAGES}/_rocm_sdk_devel/lib/${f}" \
+                "${SITE_PACKAGES}/_rocm_sdk_core/lib/${f}"; \
+        fi; \
+    done \
+    && ldconfig
+
+RUN sed -i \
+    -e '/^ROCM_SYSTEMS_REPO:/d' \
+    -e 's|^ROCM_RUNTIME_COMMIT:.*|ROCM_RUNTIME_COMMIT: replaced by stock rocm-sdk 10.0.0 (stock-runtime overlay)|' \
+    /app/versions.txt
+'''
+
+[vars.model_dir]
+description = """\
+Host directory containing the Mixtral-8x22B-Instruct-v0.1 checkpoint directory, mounted \
+read-only at /models. Only needed for full-bench runs. Empty = locate it on the node; if it is \
+not available, skip the full-bench parts and say so."""
+default = ""
+
+[vars.bench_command]
+description = "Full `vllm bench forward` command run inside the container (model at /models/Mixtral-8x22B-Instruct-v0.1)."
+default = '''torchrun --nproc-per-node=8 -m vllm.entrypoints.cli.main bench forward \
+--model=/models/Mixtral-8x22B-Instruct-v0.1 --tensor-parallel-size=8 \
+'--case=decode_64k=1*1@64000' --kv-len-jitter=0.0 --routing=auto --iters=20 \
+--samples=5 --seed=0 --output-json=/bench_output/results.json --load-format=auto \
+--max-model-len=65536 --gpu-memory-utilization=0.9 --no-enable-extensible-kv-cache'''
+
+[vars.repro_command]
+description = "Default standalone repro command run inside the container, with HIP_VISIBLE_DEVICES set to one 4-GPU set."
+default = '''torchrun --nproc-per-node=4 /work/repro.py --backend=aiter --layers=56 \
+--hidden=6144 --tokens=1 --filler-reps=15 --count=100 --calls-per-layer=2 \
+--vram-fill-gb=160'''
+
+[vars.repro_script]
+description = "Standalone repro: the bench's graph-replay pattern with a custom all-reduce, no vLLM engine and no model weights."
+default = '''"""Standalone (no vLLM engine, no model) repro of the ROCm `vllm bench forward`
+`_warmup` graph-replay hang, with a selectable all-reduce backend.
+
+Mirrors vllm/benchmarks/forward/capture.py _capture_and_time / _warmup:
+  - an RCCL "flag" rendezvous all_reduce inside the graph (as the real bench
+    captures)
+  - per-"layer" collective(s) on a [tokens, hidden] bf16 tensor, standing in
+    for the real decode graph's per-layer all-reduce(s) after attention
+    o_proj and MLP down_proj
+  - two external=True timing events around the "model" body
+  - _warmup's exact pattern: 2 synced replays to measure per_replay, then
+    count = max(20, int(seconds/per_replay)) agreed across ranks (MAX), then
+    that many replays with **no sync** until the end
+
+Backends (--backend):
+  rccl        plain torch.distributed.all_reduce (RCCL) per call -- the
+              control without a custom all-reduce.
+  vllm        vLLM's own CustomAllreduce.custom_all_reduce (registered IPC
+              buffers, gloo side-channel group).
+  aiter       AITER's custom all-reduce through vLLM's AiterCustomAllreduce
+              wrapper (what VLLM_ROCM_USE_AITER_CUSTOM_AR=1 selects).
+  aiter_fused AITER's fused all-reduce + RMSNorm (custom_fused_ar_rms),
+              1-stage kernel.
+
+Imports vllm/aiter from the image's installed site-packages only (no vLLM
+engine, no vLLM process groups). Run with torchrun.
+
+Usage:
+  torchrun --nproc-per-node=<N> repro.py --backend=aiter \
+      [--layers=56] [--hidden=6144] [--tokens=1] [--count=0] \
+      [--calls-per-layer=1] [--vram-fill-gb=0] [--filler-reps=0] \
+      [--sync-every=0] [--seconds=1.0] [--log-every=10]
+"""
+
+import argparse
+import os
+import sys
+import time
+
+import torch
+import torch.distributed as dist
+
+p = argparse.ArgumentParser()
+p.add_argument(
+    "--backend", choices=["rccl", "vllm", "aiter", "aiter_fused"], required=True
+)
+p.add_argument("--layers", type=int, default=56)
+p.add_argument("--hidden", type=int, default=6144)
+p.add_argument("--tokens", type=int, default=1)
+p.add_argument("--count", type=int, default=0, help="0 = auto like _warmup")
+p.add_argument("--sync-every", type=int, default=0, help="0 = never (matches bug)")
+p.add_argument("--seconds", type=float, default=1.0)
+p.add_argument(
+    "--filler-reps",
+    type=int,
+    default=0,
+    help="number of 4096x4096 bf16 matmuls per layer, padding replay time "
+    "toward the real decode replay's ~10ms (calibrate empirically)",
+)
+p.add_argument("--no-rccl-flag", action="store_true", help="drop the RCCL rendezvous")
+p.add_argument(
+    "--calls-per-layer",
+    type=int,
+    default=1,
+    help="all-reduce calls per layer (2 matches o_proj + down_proj)",
+)
+p.add_argument(
+    "--vram-fill-gb",
+    type=float,
+    default=0.0,
+    help="GiB of bf16 padding allocated per rank before capture, to mimic "
+    "the real bench's ~90%% VRAM occupancy from model weights",
+)
+p.add_argument(
+    "--log-every", type=int, default=10, help="print the loop index every N replays"
+)
+args = p.parse_args()
+
+rank = int(os.environ["RANK"])
+world_size = int(os.environ["WORLD_SIZE"])
+local_rank = int(os.environ["LOCAL_RANK"])
+torch.cuda.set_device(local_rank)
+device = torch.device("cuda", local_rank)
+
+
+def log(msg: str) -> None:
+    print(f"[rank {rank}] {msg}", flush=True)
+
+
+log(
+    f"pid={os.getpid()} local_rank={local_rank} "
+    f"HIP_VISIBLE_DEVICES={os.environ.get('HIP_VISIBLE_DEVICES', '')}"
+)
+
+dist.init_process_group(backend="nccl", device_id=device)
+device_group = dist.group.WORLD
+gloo_group = dist.new_group(backend="gloo")
+
+flag = torch.zeros(1, device=device)
+hidden = args.hidden
+tokens = args.tokens
+
+event_kwargs = {"enable_timing": True, "external": True}
+ev_start = torch.cuda.Event(**event_kwargs)
+ev_end = torch.cuda.Event(**event_kwargs)
+
+filler_dim = 4096 if args.filler_reps > 0 else 1
+fx = torch.randn(max(tokens, 16), filler_dim, device=device, dtype=torch.bfloat16)
+fw = torch.randn(filler_dim, filler_dim, device=device, dtype=torch.bfloat16)
+
+
+def filler():
+    if args.filler_reps > 0:
+        y = fx
+        for _ in range(args.filler_reps):
+            y = y @ fw
+        return y
+    return None
+
+
+if args.vram_fill_gb > 0:
+    n_elems = int(args.vram_fill_gb * (1024**3) // 2)  # bf16 = 2 bytes
+    vram_pad = torch.empty(n_elems, device=device, dtype=torch.bfloat16)
+    log(f"allocated {args.vram_fill_gb:.1f} GB VRAM padding")
+
+
+backend = args.backend
+ca = None
+if backend in ("vllm", "aiter"):
+    if backend == "vllm":
+        from vllm.distributed.device_communicators.custom_all_reduce import (
+            CustomAllreduce,
+        )
+
+        ca = CustomAllreduce(gloo_group, device, max_size=8192 * 1024)
+    else:
+        from vllm.distributed.device_communicators.aiter_custom_all_reduce import (
+            AiterCustomAllreduce,
+        )
+
+        ca = AiterCustomAllreduce(gloo_group, device, max_size=8192 * 1024 * 8 * 2)
+    log(f"backend={backend} disabled={ca.disabled}")
+elif backend == "aiter_fused":
+    from vllm.distributed.device_communicators.aiter_custom_all_reduce import (
+        AiterCustomAllreduce,
+    )
+
+    ca = AiterCustomAllreduce(gloo_group, device, max_size=8192 * 1024 * 8 * 2)
+    probe = torch.empty(tokens, hidden, device=device, dtype=torch.bfloat16)
+    log(
+        f"backend={backend} disabled={ca.disabled} "
+        f"use_1stage={ca.use_1stage_fused_ar_rms(probe)}"
+    )
+
+# Fixed seed: residual/weight must be identical across ranks (replicated
+# tensors in real TP, same as vLLM's residual stream and RMSNorm weight).
+torch.manual_seed(1234)
+residual = torch.randn(tokens, hidden, device=device, dtype=torch.bfloat16)
+weight = torch.randn(hidden, device=device, dtype=torch.bfloat16)
+epsilon = 1e-5
+
+
+def one_layer_collective(x: torch.Tensor) -> torch.Tensor:
+    if backend == "rccl":
+        dist.all_reduce(x, group=device_group)
+        return x
+    if backend in ("vllm", "aiter"):
+        out = ca.custom_all_reduce(x)
+        return out if out is not None else x
+    if backend == "aiter_fused":
+        out, _res = ca.aiter_ca.custom_fused_ar_rms(
+            x, residual, weight, epsilon, use_1stage=True, gemma_norm=False
+        )
+        return out
+    raise AssertionError(backend)
+
+
+# --- Correctness check on a synced, non-captured call before trusting the
+# graph: every rank's local tensor is all-ones * world_size after all-reduce.
+check_x = torch.ones(tokens, hidden, device=device, dtype=torch.bfloat16)
+torch.cuda.synchronize()
+if not args.no_rccl_flag:
+    dist.all_reduce(flag, group=device_group)
+if backend == "aiter_fused":
+    check_sum = world_size * check_x.float() + residual.float()
+    rms = check_sum * torch.rsqrt(check_sum.pow(2).mean(-1, keepdim=True) + epsilon)
+    expected_out = (rms * weight.float()).to(torch.bfloat16)
+    expected_residual = check_sum.to(torch.bfloat16)
+    actual_out, actual_residual = ca.aiter_ca.custom_fused_ar_rms(
+        check_x.clone(), residual, weight, epsilon, use_1stage=True, gemma_norm=False
+    )
+    torch.cuda.synchronize()
+    out_err = (actual_out.float() - expected_out.float()).abs().max().item()
+    res_err = (actual_residual.float() - expected_residual.float()).abs().max().item()
+    log(f"correctness check: out_max_err={out_err:.4f} residual_max_err={res_err:.4f}")
+    if out_err > 0.5 or res_err > 0.5:
+        log("CORRECTNESS CHECK FAILED -- aborting before trusting hang tally")
+        sys.exit(2)
+else:
+    check_out = one_layer_collective(check_x.clone())
+    torch.cuda.synchronize()
+    expected = float(world_size)
+    actual = check_out.float().mean().item()
+    log(f"correctness check: mean={actual:.4f} expected={expected:.4f}")
+    if abs(actual - expected) > 0.05 * expected:
+        log("CORRECTNESS CHECK FAILED -- aborting before trusting hang tally")
+        sys.exit(2)
+
+# --- Capture the graph: RCCL flag rendezvous, N layers' collective, events.
+x = torch.randn(tokens, hidden, device=device, dtype=torch.bfloat16)
+torch.cuda.synchronize()
+stream = torch.cuda.Stream()
+stream.wait_stream(torch.cuda.current_stream())
+with torch.cuda.stream(stream):
+    # Warm up any per-stream lazy init (allocator pools, aiter signal setup)
+    # outside capture, mirroring capture.py's pre-capture _run_model() calls.
+    if not args.no_rccl_flag:
+        dist.all_reduce(flag, group=device_group)
+    for _ in range(args.layers):
+        y = x.clone()
+        for _ in range(args.calls_per_layer):
+            y = one_layer_collective(y)
+        filler()
+torch.cuda.current_stream().wait_stream(stream)
+torch.cuda.synchronize()
+
+graph = torch.cuda.CUDAGraph()
+capture_cm = ca.capture() if ca is not None else None
+if capture_cm is not None:
+    capture_cm.__enter__()
+with torch.cuda.graph(graph, stream=stream):
+    if not args.no_rccl_flag:
+        dist.all_reduce(flag, group=device_group)
+    ev_start.record()
+    out = x
+    for _ in range(args.layers):
+        for _ in range(args.calls_per_layer):
+            out = one_layer_collective(out)
+        filler()
+    ev_end.record()
+if capture_cm is not None:
+    capture_cm.__exit__(None, None, None)
+
+log(f"graph captured ({args.layers} layers, backend={backend}), starting _warmup loop")
+
+graph.replay()
+torch.cuda.synchronize()
+begin = time.perf_counter()
+graph.replay()
+torch.cuda.synchronize()
+per_replay = max(time.perf_counter() - begin, 1e-6)
+
+count_t = torch.tensor(
+    [args.count or max(20, int(args.seconds / per_replay))], device=device
+)
+dist.all_reduce(count_t, op=dist.ReduceOp.MAX, group=device_group)
+count = int(count_t.item())
+
+log(f"per_replay={per_replay:.6f}s count={count}")
+sys.stdout.flush()
+
+start_wall = time.perf_counter()
+for i in range(count):
+    graph.replay()
+    if args.sync_every and (i + 1) % args.sync_every == 0:
+        torch.cuda.synchronize()
+    if args.log_every and i % args.log_every == 0:
+        print(
+            f"[rank {rank}] loop index {i} t={time.perf_counter() - start_wall:.3f}s",
+            flush=True,
+        )
+
+torch.cuda.synchronize()
+elapsed_us = ev_start.elapsed_time(ev_end) * 1000
+print(
+    f"[rank {rank}] DONE all {count} replays, "
+    f"per-replay event time ~{elapsed_us:.1f}us",
+    flush=True,
+)
+sys.stdout.flush()
+# Skip teardown (aiter's CustomAllreduce.__del__ raises benign AttributeErrors
+# at interpreter shutdown ordering) so the exit code reflects the run only.
+os._exit(0)
+'''
+
+[vars.question]
+description = "Optional extra focus or hints."
+default = ""
+
+[vars.known_context]
+description = "Findings from earlier measurements of this hang. Confirm what your conclusions depend on."
+default = '''1. The hang. `vllm bench forward` captures a decode CUDA graph and, in
+`ForwardBench._warmup` (vllm/benchmarks/forward/capture.py), replays it about 100 times with no
+host sync. In a hang, one or more ranks' host threads block forever inside `hipGraphLaunch`
+(called from `CUDAGraph.replay`), busy-waiting in `sched_yield`, while that rank's GPU reads 0%
+in `rocm-smi --showuse`. The other ranks' GPUs read ~100%: they are spinning inside the custom
+all-reduce kernel (e.g. `aiter::ar_ll_gfx9`) on a flag the stuck rank never writes; their hosts
+then block in the same wait once their own queues fill. Nothing is printed and the process
+never exits. The standalone repro given in this task reproduces it without a vLLM engine or
+model.
+
+2. The two images. Both contain identical Python packages (vLLM, torch 2.13.0+rocm10.0.0,
+AITER); only the ROCm runtime libraries differ.
+- Image A (original) is the vLLM ROCm nightly. Its libamdhip64 / libhsa-runtime64 are built
+  from source by the vLLM image build at rocm-systems commit
+  25e14349f2606a6b95c4ccd45eb92a1835646cf2 (tip of an unmerged development branch,
+  `users/mattwong/dev0903/hsa_gpu_edge_signal-prerebase-20260918`), Release mode, stripped.
+  /app/versions.txt records it. HIP file `libamdhip64.so.7.16.26361-25e14349f2`, GNU build ID
+  022727d1b473b0df78f52adbb5766a293170670f, sha256 2f5b1183ef219416a48ef5cf734d6bf570aef1c4
+  4656bcd274ae25f58c5e0255. No debug symbols for it exist anywhere.
+- Image B (stock runtime) is image A plus the overlay Dockerfile, which reinstalls TheRock's
+  stock rocm-sdk-core / rocm-sdk-devel 10.0.0 release wheels. TheRock's `therock-10.0` tag
+  (16adc4d875fd4f65ea23c7c84e1c66706fde3047) pins rocm-systems at
+  6b0e43f341195e203754e08f850e437ff2fc09f9. HIP file `libamdhip64.so.7` (version
+  7.15.26333-0000000), stripped, no build-ID note, sha256 1a8bcd00d05cce36bebcf4acf30289f36f65
+  62ec532e9c618c42e9bd2d90ed05; its libhsa-runtime64 is not stripped (sha256
+  815364af872593e577206ff22a29141af63e800a78488b2ee02cf04532e14a46).
+- Both images set ROCPROFILER_QUEUE_INTERPOSITION=0, HIP_FORCE_DEV_KERNARG=1,
+  HSA_NO_SCRATCH_RECLAIM=1 and HSA_ENABLE_IPC_MODE_LEGACY=1.
+
+3. Hang rates.
+- Full Mixtral-8x22B-Instruct-v0.1 `decode_64k` bench, TP=8 on 8x MI300X: image A 65/100;
+  image B 5/100 and, in a later run, 4/166.
+- Standalone repro, default command, TP=4: image A 10/100, 7/100, 2/100, 6/50 and 3/16 on
+  different MI300X nodes, and 7/50 on an 8x MI350 (gfx950) node with the VRAM fill raised to
+  220 GiB. Image B has NEVER hung in the repro: 0/100, 0/50 and 0/50 at TP=4 and 0/100 at
+  TP=8 on MI300X, 0/100 at TP=4 and TP=8 on MI350. Getting image-B hangs needs the full bench.
+- Repro ingredients (image A): a custom all-reduce in the graph (vLLM's or AITER's; plain RCCL
+  0/100), >=2 custom all-reduce calls per layer (1 call: 0/80), and >=~140 GiB of the 192 GiB
+  filled. HIP_FORCE_DEV_KERNARG=0, HSA_NO_SCRATCH_RECLAIM=0 and HSA_ENABLE_IPC_MODE_LEGACY=0
+  had no effect. AMD_LOG_LEVEL=3 suppressed the hang: it is timing-sensitive, and heavy
+  instrumentation can hide it.
+
+4. The stuck wait: HIP's queue-slot wait.
+- Source. Both images' stuck loop matches `VirtualGPU::WaitForQueueSlot()` (ROCclr,
+  `projects/clr/rocclr/device/rocm/rocvirtual.hpp`, inlined), called from
+  `dispatchAqlPacketBatchFlat()` in `rocvirtual.cpp` as `WaitForQueueSlot(startIndex + chunkEnd
+  - 1, sw_queue_size)`, reached from `hip_graph_internal.cpp`'s graph-segment loop through a
+  virtual call. It caches the queue's read index, loops while (target write index - read
+  index) >= a threshold, and calls amd::Os::yield() (`sched_yield`) between polls. The
+  function's text is identical at both images' rocm-systems revisions.
+- Image A binary. Inner stuck frame returns to file offset 0x6a835d (after a call to a
+  `sched_yield` thunk at 0x6587d0). Loop: queue pointer `[r15+0x90]` passed to
+  `hsa_queue_load_read_index_scacquire`, read index cached at `[r15+0x140]`, target write
+  index at `[rsp+0x80]`, threshold at `[rsp+0xb0]`. 7 libamdhip64 frames under a
+  rocprofiler-sdk `graph_launch<hipGraphLaunch>` wrapper frame.
+- Image B binary. Inner frame returns to file offset 0x608fed (after a call to a
+  `sched_yield` thunk at 0x5cda10); loop at 0x608fc0-0x608ff9: queue pointer `[rbx+0x90]`,
+  read index cached at `[rbx+0x140]`, target write index at `[rsp+0x58]`, threshold in
+  `r13`, exits when occupied < threshold. Outer frame returns to 0x1b97cd after an indirect
+  call `callq *0x1a0(%rax)`. Only 2 libamdhip64 frames, directly under `CUDAGraph.replay`, and
+  no rocprofiler-sdk wrapper frame -- even with interception on.
+- Live evidence. Image A: live rocgdb breakpoints in 3+ hangs showed occupied = 16461 (more
+  than the ring's 16384-packet capacity), threshold = 952, read index bit-identical over
+  seconds and across hangs; busy peers' hosts were parked in the same loop on their own ring.
+  Image B: the identification rests on the disassembly match plus 4 full-bench hangs whose
+  py-spy stacks have exactly the predicted 2-frame shape. No live register sample of an
+  image-B hang exists: earlier probes used image A's register layout, and a host-PID vs
+  container-PID mix-up broke another attempt.
+
+5. The polled ring and rocprofiler-sdk queue interception.
+- In image A hangs, the polled ring (hsa_queue_t type 0, kernel-dispatch feature, 16384
+  packets) is NOT one of the queues `rocgdb`'s `info queues` lists for the process. The stuck
+  rank's listed queues were all drained (read == write) with no active dispatch; one busy
+  peer's listed compute queue was exactly full. Counting anonymous 1 MiB mappings in
+  /proc/<pid>/maps did NOT separate intercept rings from hardware queues (14-22 such mappings
+  in every condition) -- do not use that proxy.
+- What enables interception: `libtorch_cpu.so` links librocprofiler-sdk.so.1 and exports
+  `rocprofiler_configure` (Kineto's `RocprofLogger`: toolInit, HIP API callback tracing,
+  buffer tracing, code-object callbacks). At HIP/HSA start-up librocprofiler-register scans
+  loaded libraries for `rocprofiler_configure` and attaches torch as a tool. Every run of both
+  images then prints `[queue-intercept] device-memory ring-buffer requested but profiling
+  requires system-memory InterceptQueue; falling back to system-memory ring ...` (from
+  rocprofiler-sdk's queue_controller.cpp). ROCPROFILER_QUEUE_INTERPOSITION=0 does not prevent
+  this; `ROCPROFILER_REGISTER_ENABLED=0` on the container does (no warning, no rocprofiler
+  frame, repro correctness check still passes). That one switch removes both the HIP API
+  wrappers and the queue interception, so it cannot tell them apart.
+- Ablation, standalone repro, 50 trials per cell: image A 6/50 with registration on vs 0/50
+  off (two-sided Fisher p = 0.027); image B 0/50 both ways. Not tested on the full bench.
+- The ring's creator has never been attributed directly (no queue-creation breakpoints or
+  interposer has been run).
+- One intervention on a hung image-A process: calling
+  `hsa_queue_store_read_index_screlease` on the polled queue to advance its read index left it
+  unchanged (read 35055, write 51773) and the process stayed stuck. Why the store did not take
+  is unexplained.'''
+
+[vars.rules]
+description = "Rules for using a shared GPU node safely."
+default = '''RULES FOR THE GPU NODE. The node is shared: other users may keep containers there and may
+start GPU work inside or outside Slurm. Run docker and Slurm commands on the node itself (ssh
+to it first if it is not the local host).
+1. Allocation. If Slurm manages the node, hold ONE allocation of all 8 GPUs for the whole
+   measurement: `salloc --gres=gpu:<gres type>:8 -w <node> --no-shell -t <limit> -J
+   <claimed bead id>` (read the partition and GPU gres type from `scontrol show node
+   <node>`), and confirm with `scontrol show job -d` that you hold GPU indices 0-7. Without
+   Slurm, confirm nobody else is using the GPUs and record how you checked. Either way, confirm
+   with `rocm-smi --showuse`, `--showmeminfo vram` and `--showpidgpus` that no foreign
+   process holds any GPU, and recheck before every trial. If a foreign process appears, stop
+   after the in-flight trial and wait or record a blocker. Never run on GPUs someone else
+   holds, and never touch other users' jobs, containers or images. `scancel` your
+   allocation when done.
+2. Scheduled work. Before allocating, look for recurring work on the node (`sacct -N <node>
+   -S <a week back> -X`, `squeue -w <node>`, readable crontabs and systemd timers, and the
+   node notes). End the allocation before any scheduled GPU job or image build you find. If
+   the work is not finished by then, stop after a complete block of arms (so arms stay
+   balanced), release the allocation, and resume with a new allocation after the scheduled
+   work is done -- never cancel or preempt anyone else's job. Record every break.
+3. Images. Pull image A by digest if it is absent. Build image B from the overlay Dockerfile
+   with the default docker driver into an empty scratch build context you own: `docker build
+   -f <Dockerfile> --build-arg BASE_IMAGE=<image A> -t <stock image tag> <empty dir>`. If the
+   stock tag already exists and you did not build it in this run, verify it (library build
+   IDs, /app/versions.txt) before use or build under a new tag. Never retag, overwrite or
+   remove images you did not create, never push, never run `docker system prune` / `docker
+   builder prune`. Check free space on docker's data root before pulling or building and stop
+   if it would drop below ~60 GB. Record any Dockerfile edit needed to make it build.
+4. Containers. Base flags: `--device=/dev/kfd --device=/dev/dri --group-add=video
+   --security-opt=seccomp=unconfined --cap-add=SYS_PTRACE --ipc=host
+   --ulimit=memlock=-1:-1 --entrypoint=bash -e HIP_VISIBLE_DEVICES=<GPU list>`, plus
+   `--shm-size=16g` for the standalone repro or `--shm-size=64g -e VLLM_ROCM_USE_AITER=1` for
+   the full bench. Mount only what a trial needs, read-only: the repro script at
+   /work/repro.py; for the full bench, the model directory at /models and a per-run
+   directory at /bench_output (read-write). Name containers with your claimed bead ID plus the
+   arm and trial number, use one fresh container per trial, and `docker rm -f` on every exit
+   path. Never modify either image and never bind-mount over vLLM, AITER, torch or ROCm files.
+   Install diagnostic tools (py-spy, perf, ...) only inside your own running containers.
+5. Timeouts and hang capture. Give every trial a wall-clock timeout of about 2x the slowest
+   clean trial of the same arm, measured on the first trials, never unbounded. Detect a hang
+   earlier when no rank's loop index advances for well past the expected replay time. Before
+   removing a hung trial, capture at least `py-spy dump --native --locals` for every rank,
+   `rocm-smi --showuse` and `--showpidgpus`, each rank's last loop index, and the container
+   log. Map ranks to PIDs and GPUs carefully (quote the shell) and test the whole capture path
+   on a live, non-hung container before the trial loop starts.
+6. Loops. Run trial loops detached (setsid/nohup) and monitor them with checks that cannot
+   match themselves (`test -f`, a tally file, `pgrep -f '[l]oop_name'`), never a plain `pgrep
+   -f <name>`. Keep per-trial logs small and check free disk space periodically.
+7. Host. Do not change host sysctls, kernel modules, driver parameters or anything else
+   outside your containers and your own files. Read kernel logs, sysfs and debugfs where
+   they are readable without such changes, and record what was not accessible.'''
+
+[vars.build_rules]
+description = "Rules for rebuilding rocm-systems libraries into derived diagnostic images, and for working on a GPU node that is not the rig host."
+default = '''RULES FOR DIAGNOSTIC BUILDS AND REMOTE NODES.
+1. Derived images. You may build new local images FROM image A (and, in the optional image-B
+   part, from image B) that replace runtime libraries with your own builds. Tag them
+   `local/<formula id>:<variant>` (e.g. `...:a-rebuilt`, `...:a-trace`), and record for each the
+   base image, the rocm-systems revision and patch, the build command and flags, and the sha256
+   of every library replaced. Never modify, retag or remove images A or B or any image you did
+   not create; never push. Replace libraries the way the image's own build does (same file names
+   and symlinks, `ldconfig`), and verify in a container which files a process actually maps.
+2. Builds. Build in containers you own (image A has the ROCm toolchain), not on the host.
+   Diagnostic patches live only on your own worktree branches in the rocm-systems rig; never push
+   them and never propose them upstream.
+3. Remote node. The rig (rocm-systems checkout, worktrees) and the artifact directory are on the
+   rig host; the GPU node may be a different machine without them. If so: stage everything a
+   trial needs (repro script, harness and probe scripts, trace decoders) in a per-bead work
+   directory on the node, move derived images there with `docker save | ssh <node> docker load`
+   (or build them on the node from a copied context), run docker and GPU work on the node, and
+   copy every result, trace and log back into the artifact directory before you close your
+   step. Map PIDs in the namespace of the tool you run (host and container PIDs differ).'''
+
+[[steps]]
+id = "body"
+title = "Find why the polled ring stops advancing in the ROCm graph-replay hang, using an instrumented rebuild of the original runtime"
+needs = ["experiment"]
+metadata = { "gc.kind" = "scope", "gc.scope_name" = "rocm-graph-replay-hang-intercept-forwarding-trace", "gc.scope_role" = "body" }
+
+[[steps]]
+id = "investigate"
+title = "Map the queue-interception forwarding path, rebuild image A's runtime from its exact revisions, and add a validated low-overhead event trace"
+needs = []
+metadata = { "gc.run_target" = "rocm-systems/investigation.investigator", "gc.scope_ref" = "body", "gc.scope_role" = "member", "gc.on_fail" = "abort_scope" }
+description = """
+Goal: explain why the read index of the ring that the stuck host polls (background items 4-5)
+stops advancing. Live probing of stock binaries only shows that it is frozen; watching the path
+that is supposed to advance it needs instrumentation inside rocm-systems. Your job: understand
+that path from source, rebuild image A's runtime from its exact revisions, confirm the rebuild
+matches the shipped binaries, and add an event trace light enough not to suppress the hang.
+Diagnostic builds only; nothing proposed upstream.
+
+Working hypothesis, to confirm or refute rather than assume: the polled ring is a
+rocprofiler-sdk queue-interception ring (created because torch registers as a rocprofiler-sdk
+tool), and packets stop being forwarded from it to the hardware queue -- for example because a
+wake-up armed when the hardware queue was full is lost. Your trace must record which queue HIP
+polls and what kind it is, so the run settles this independently.
+
+NODE (empty = the local host)={{node}}
+IMAGE A (original, custom runtime)={{original_image}}
+IMAGE B (stock runtime; only for the optional image-B part)={{stock_image_tag}}
+MODEL DIRECTORY ON THE HOST (empty = locate it; only for the optional image-B part)={{model_dir}}
+NODE NOTES: {{node_notes}}
+
+Background -- confirm or correct, do not trust blindly:
+
+{{known_context}}
+
+{{rules}}
+
+{{build_rules}}
+
+Standalone repro script. Write it verbatim to `repro.py` under the artifact directory and mount
+it read-only at /work/repro.py; record any change you make to it as a diff.
+
+----- BEGIN repro.py -----
+{{repro_script}}
+----- END repro.py -----
+
+Default repro command (inside the container, HIP_VISIBLE_DEVICES set to one 4-GPU set):
+
+{{repro_command}}
+
+Full-bench command (inside the container), for the optional image-B part only:
+
+{{bench_command}}
+
+Overlay Dockerfile for image B (only needed for the optional image-B part):
+
+----- BEGIN Dockerfile -----
+{{overlay_dockerfile}}
+----- END Dockerfile -----
+
+Additional focus or hints: {{question}}
+
+Source. Use the rocm-systems rig's repository (projects/clr for HIP/ROCclr, projects/rocr-runtime
+for ROCr, projects/rocprofiler-sdk). Per your pack's worktree protocol, create a worktree on
+branch `{{formula_id}}/investigate/<claimed-bead-id>-a` at image A's runtime commit
+(25e14349f2606a6b95c4ccd45eb92a1835646cf2, fetched by SHA). Image A's custom build replaced
+only HIP and ROCr; its rocprofiler-sdk (and anything else) came from TheRock's 10.0.0 wheels,
+built from the rocm-systems revision TheRock's `therock-10.0` tag pins
+(6b0e43f341195e203754e08f850e437ff2fc09f9). Confirm which revision each loaded library in image A
+was built from (compare sha256 / build IDs with image B, which ships the stock 10.0.0 files), and
+create a second worktree on `{{formula_id}}/investigate/<claimed-bead-id>-p` at that pin if you
+need to rebuild rocprofiler-sdk. Commit your instrumentation on these branches.
+
+Concretely:
+1. Images. Get image A (and image B only if you will do the optional part). Record the image IDs,
+   and for each loaded libamdhip64 / libhsa-runtime64 / librocprofiler-sdk /
+   librocprofiler-register: path, sha256, build ID, and the revision you believe it was built
+   from, with the evidence.
+2. The path that should advance the polled ring, with file:line at each revision used:
+   - HIP: `WaitForQueueSlot()` and its caller (`dispatchAqlPacketBatchFlat()`), how the target
+     index and threshold are computed, and which `hsa_queue_t*` it polls when a tool intercepts
+     queues.
+   - rocprofiler-sdk: when and how it intercepts queues (queue controller, queue wrapper), the
+     per-packet callbacks it runs, and how it hands packets on.
+   - ROCr: the intercept / proxy queue -- where its ring lives, who writes it, how, on which
+     thread and when packets are forwarded to the hardware queue, what happens when the hardware
+     queue is full (retry path, which signal or handler is armed, which thread runs it), and who
+     advances the intercept ring's read index.
+   - Every place where a wake-up can be missed: the order of "check free space", "arm wake-up"
+     and "re-check" on each side, and any signal reuse or reset. Write down concrete candidate
+     races, each with the event sequence that would freeze the read index while the hardware
+     queue drains.
+3. Faithful rebuild. Rebuild image A's ROCr and HIP from the commit with the recipe image A was
+   built with -- the vLLM repository's ROCm base Dockerfile (its build_rocm_runtime stage), at
+   the vLLM revision that matches image A's /app/versions.txt -- so that compiler, flags and
+   CMake options match. Install them into a derived image `...:a-rebuilt` per the build rules
+   (keep a symbol-bearing copy alongside; stripping must not change code). Show the rebuild is
+   faithful: compare code of the key functions (at least the WaitForQueueSlot loop and the ROCr
+   intercept-queue forwarding and retry functions) between the shipped and rebuilt libraries --
+   byte-identical text is ideal; otherwise explain every difference. If rocprofiler-sdk needs
+   instrumenting, rebuild it from the pin the same way and check it the same way.
+4. Event trace. Add a compile-time-enabled trace to the rebuilt libraries: a fixed-size
+   in-memory ring buffer per process (lock-free append, monotonic timestamp, thread ID, event
+   type, queue pointer and kind, read/write/doorbell indices, signal handle and value), with no
+   I/O while the process runs, and readable from a hung process with rocgdb (a known symbol and
+   layout) and dumpable at a clean exit. Cover at least: HIP WaitForQueueSlot entry, each poll
+   that finds no room (sampled or counted), and exit; HIP's write-index publish and doorbell
+   store; intercept-ring enqueue and doorbell; each forwarding attempt (packets forwarded, free
+   space seen in the hardware queue); queue-full handling (wake-up armed: what, on which signal);
+   wake-up fired and by which thread; intercept-ring read-index advances; and the rocprofiler-sdk
+   per-dispatch callbacks around forwarding. Write a decoder that turns a dump into a per-queue
+   timeline. Build the derived image `...:a-trace`.
+5. Validate on GPU per the rules: in `...:a-rebuilt` and `...:a-trace`, the repro's correctness
+   check passes; the expected libraries are mapped; in `...:a-trace` the decoder yields a
+   coherent timeline from a clean run that shows the host's periodic back-pressure stalls
+   (background item 3) resolving. Measure the trace's overhead (clean trial time and per-replay
+   time vs `...:a-rebuilt`). If it is more than a few percent, make it lighter before handing off.
+6. Plan the experiment: arms, trial counts, predictions under each candidate race and under "the
+   hypothesis is wrong", how a hang's trace will be read (which events must be present or absent
+   for each candidate), and the causal test for the leading candidate (step 4 of the experiment).
+
+Use `{{artifact_dir}}` as the shared directory for this run. Write artifacts under
+`{{artifact_dir}}/investigate/` (create it; it must not contain an earlier run's files; do not
+overwrite existing files): source notes with references (repository, revision, file, line), the
+candidate races, the instrumentation patch(es) as diffs with their commit SHAs, build commands
+and logs, the faithfulness comparison, derived-image IDs and library hashes, the decoder, the
+validation output, and the repro script.
+
+Before closing, write `{{artifact_dir}}/investigate/investigation.md` with: your claimed bead ID;
+the source-level account of the forwarding, retry and wake-up path; the candidate races with
+event sequences; the rebuild recipe and the faithfulness evidence; the trace design, event list,
+overhead and validation; derived-image tags, IDs and how to move them to the GPU node; and the
+experiment plan with predictions. Separate fresh observations from the supplied background and
+from untested hypotheses.
+
+Append the handoff summary and absolute report path to this claimed step's notes with
+`gc bd update <claimed-bead-id> --append-notes <text>` and record
+`--set-metadata investigation.report_path=<path>`. Verify the report is readable, then set
+`gc.outcome=pass` on this claimed step and close only it. `pass` means the investigation
+completed, including if it contradicts the working hypothesis.
+
+If blocked (for example the rebuild cannot be made faithful), append the reason, set
+`gc.outcome=fail` and `gc.failure_reason=<reason>`, and close only this step. Do not close the
+workflow root.
+"""
+
+[[steps]]
+id = "experiment"
+title = "Check the rebuilt runtime still hangs, capture event traces from hung and clean processes, and test the identified mechanism causally"
+needs = ["investigate"]
+metadata = { "gc.run_target" = "rocm-systems/experimentation.experimenter", "gc.scope_ref" = "body", "gc.scope_role" = "member", "gc.on_fail" = "abort_scope" }
+description = """
+Read `{{artifact_dir}}/investigate/investigation.md` before running anything. Read the producer
+bead ID recorded in it, and verify it belongs to the same `gc.root_bead_id` as your claimed
+step and has `gc.outcome=pass`. Use its derived images, decoder and plan, but test them; do not
+assume its conclusions are correct.
+
+Question: why does the read index of the ring that the stuck host polls stop advancing?
+Diagnostic builds only; nothing proposed upstream.
+
+NODE (empty = the local host)={{node}}
+IMAGE A (original, custom runtime)={{original_image}}
+IMAGE B (stock runtime; only for the optional image-B part)={{stock_image_tag}}
+MODEL DIRECTORY ON THE HOST (empty = locate it; only for the optional image-B part)={{model_dir}}
+HUNGS TO TRACE={{hangs_to_trace}}
+REPRO TRIALS PER ARM={{repro_trials_per_arm}}
+TIME BUDGET (hours of node time)={{time_budget_hours}}
+NODE NOTES: {{node_notes}}
+
+Background -- confirm or correct, do not trust blindly:
+
+{{known_context}}
+
+{{rules}}
+
+{{build_rules}}
+
+Extra rule for this step: a hung trial's container may be kept running to read its trace and
+probe it, but only while you hold the allocation; remove it before the allocation ends or you
+stop.
+
+The repro script, repro command, full-bench command and overlay Dockerfile are the ones the
+investigation step used (copied under `{{artifact_dir}}/investigate/`); the canonical versions:
+
+----- BEGIN repro.py -----
+{{repro_script}}
+----- END repro.py -----
+
+Default repro command:
+
+{{repro_command}}
+
+Full-bench command:
+
+{{bench_command}}
+
+----- BEGIN Dockerfile -----
+{{overlay_dockerfile}}
+----- END Dockerfile -----
+
+Additional focus or hints: {{question}}
+
+If you need further diagnostic builds, branch from the investigation's commits in the
+rocm-systems rig on `{{formula_id}}/experiment/<claimed-bead-id>`, per your pack's worktree
+protocol, and record each variant's commit SHA.
+
+Follow your six-step protocol for every experiment: hypothesis, prediction (recorded before
+running), exact command/environment, run, actual result, verdict (supports / contradicts /
+inconclusive). Interleave arms in blocks with a fixed-seed order (record the seed and order) and
+capture hang evidence per the rules. At minimum:
+1. Fidelity. Repro on image A vs `...:a-rebuilt`, {{repro_trials_per_arm}} trials each,
+   interleaved. The rebuilt runtime must hang at a rate compatible with image A's (two-sided
+   Fisher exact test; background item 3 gives image A's usual range). If it does not, stop:
+   report the discrepancy, its likely cause, and close with gc.outcome=fail -- a trace from a
+   runtime that does not reproduce the bug explains nothing.
+2. Trace perturbation. Repro on `...:a-trace` vs `...:a-rebuilt`, {{repro_trials_per_arm}} trials
+   each, interleaved. If the trace visibly suppresses the hang, make it lighter (fewer events,
+   counters instead of records) and repeat with the lighter variant; record every variant.
+3. Traces. Capture at least {{hangs_to_trace}} hangs with the trace build. For each, read the trace
+   from the stuck rank and one busy peer (rocgdb, without changing process state), then also
+   take the usual py-spy / rocm-smi / `info queues` evidence. Decode per-queue timelines and
+   record: which queue HIP's wait polls and what kind it is; the last forwarding, queue-full,
+   wake-up-armed and wake-up-fired events for that ring and for the hardware queue behind it,
+   with their indices and timestamps; and what the trace shows after the freeze. Do the same for
+   several clean trials, especially around back-pressure stalls that resolved. Compare hung and
+   clean sequences and say which candidate race (or which unforeseen sequence) the hung traces
+   show, and on how many of the traced hangs.
+4. Causal test of the leading mechanism. Build a variant that widens the suspected race window
+   (for example a short delay or yield inserted at the point the trace implicates) and predict a
+   higher hang rate; run it against `...:a-trace` (or `...:a-rebuilt`) for
+   {{repro_trials_per_arm}} trials each. Optionally, as evidence only, build a variant that closes
+   the window (for example re-checking free space after arming the wake-up) and predict a lower
+   hang rate; run it the same way. Report rates with Wilson 95% CIs and Fisher p-values, and
+   check that each variant changes only what it is meant to.
+5. Optional, if budget remains: test whether image B's (stock) hang is the same mechanism. Rebuild
+   the implicated library or libraries from TheRock's pin with the same trace, overlay them on
+   image B per the build rules, and capture traces from image-B hangs with the full-bench command
+   at TP=8 on all 8 GPUs (image B hangs ~2-5% per run and has never hung in the repro).
+Estimate the total duration before the main loops and fit it to the time budget; if the budget
+runs out, stop after a complete block and report the counts you have.
+
+Save experiment records and raw output under `{{artifact_dir}}/experiment/` (create it; do not
+overwrite existing files) and write `{{artifact_dir}}/experiment/experiments.md`. Put first: a
+plain answer, with confidence, to "why does the polled ring stop advancing?", naming the
+component, function and source line where the race or stall occurs, and the event sequence; then
+the fidelity, perturbation and causal tables (trials, hangs, rate, Wilson 95% CI, Fisher p); then
+one annotated timeline excerpt per traced hang and one per resolved clean stall. Then give: the
+producer bead ID; every experiment's six steps; derived images (tags, IDs, base, revision, patch
+commit, library hashes); claimed bead ID, node, GPUs, Slurm job(s), time span; exact commands,
+container flags and timeouts; every hang with evidence paths; failed trials and causes; and what
+remains uncertain, including what a fix would have to change, in which component, and whether
+image B is shown to share the mechanism.
+
+Append the summary and absolute artifact paths to this claimed step's notes with
+`gc bd update <claimed-bead-id> --append-notes <text>`, set `experiment.report_path=<path>`
+and `gc.outcome=pass`, and close only this step. `pass` means the experiments were completed,
+even if the working hypothesis is contradicted.
+
+If the handoff is missing, stale or unusable, the fidelity check fails, or runtime resources
+prevent execution, record the blocker, set `gc.outcome=fail` and `gc.failure_reason=<reason>`,
+and close only this step. Do not fabricate results or close earlier steps or the workflow root.
+"""
