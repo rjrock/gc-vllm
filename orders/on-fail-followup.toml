@@ -1,0 +1,13 @@
+[order]
+description = """\
+General, formula-agnostic mechanism: whenever ANY v2 formula's workflow root \
+bead closes with gc.outcome=fail, route the failure (formula, failed step, \
+gc.failure_reason, and any optional fast-path hint vars the formula declared) \
+to the mayor as a task bead, so the mayor can decide what to do -- including \
+authoring and launching a brand-new follow-up formula that did not exist when \
+the original formula was written. Not specific to any one formula or bug, and \
+not gated on a formula author knowing the right follow-up in advance. See \
+scripts/on-fail-followup.sh."""
+trigger = "event"
+on = "bead.closed"
+exec = "$ORDER_DIR/scripts/on-fail-followup.sh"
